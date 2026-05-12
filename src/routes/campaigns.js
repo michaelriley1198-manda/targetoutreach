@@ -1,0 +1,447 @@
+import express from 'express';
+import { supabase } from '../db.js';
+import { generatePromptsForCampaign, launchCampaign } from '../pipeline/run.js';
+import { getProgress } from '../pipeline/progress.js';
+import { synthesizeVoicemail, renderScript, audioFileExists, synthesizeAnnouncement, announceFileExists } from '../services/elevenlabs.js';
+import crypto from 'node:crypto';
+import { setSequenceActive, archiveSequence } from '../services/apollo.js';
+import axios from 'axios';
+
+export const campaignsRouter = express.Router();
+
+// Wrap async handlers so thrown errors land on the central error middleware
+// with a JSON body. Without this, async throws hang the request.
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+// Day-0 / Day-3 / Day-5 / Day-8 / Day-12 — wait_days is relative to the previous step
+const DEFAULT_SEQUENCE = [
+  { type: 'email', wait_days: 0, active: true, label: 'Initial email' },
+  { type: 'call',  wait_days: 3, active: true, label: 'Call + voicemail' },
+  { type: 'email', wait_days: 2, active: true, label: 'Bump email' },
+  { type: 'call',  wait_days: 3, active: true, label: 'Second call + VM' },
+  { type: 'email', wait_days: 4, active: true, label: 'Final email' },
+];
+
+const DEFAULT_TEMPLATES = [
+  { subject: 'Quick question about [COMPANY]', body: 'Hi [FIRST_NAME],\n\nI lead acquisitions at our firm and have been following [COMPANY]. Would you be open to a brief intro call?\n\nBest,\n[SENDER]' },
+  { subject: 'Following up — [COMPANY]', body: 'Hi [FIRST_NAME],\n\nWanted to bump my last note. Happy to share more about how we work.\n\nBest,\n[SENDER]' },
+  { subject: 'Last note — [COMPANY]', body: 'Hi [FIRST_NAME],\n\nIf the timing isn\'t right, totally understand. I\'ll keep an eye on [COMPANY] and reach back out down the road.\n\nBest,\n[SENDER]' },
+];
+
+const DEFAULT_VM_SCRIPT = "Hi [FIRST_NAME], this is calling about [COMPANY]. I lead acquisitions at our firm and wanted to share a quick thought about [INDUSTRY]. I'll send a follow-up email — talk soon.";
+
+// ---------- create / list ----------
+
+campaignsRouter.post('/', wrap(async (req, res) => {
+  const {
+    name, prompt, sequence_config, email_templates, vm_script,
+    target_lead_count, min_priority_score, max_search_batches,
+    lead_sources, apollo_filter_json, apollo_list_id, apollo_list_name,
+  } = req.body || {};
+  if (!name || !prompt) return res.status(400).json({ error: 'name and prompt required' });
+
+  const insertRow = {
+    name,
+    prompt,
+    status: 'paused',
+    sequence_config: sequence_config?.length ? sequence_config : DEFAULT_SEQUENCE,
+    email_templates: email_templates?.length ? email_templates : DEFAULT_TEMPLATES,
+    vm_script: vm_script || DEFAULT_VM_SCRIPT,
+  };
+  if (Number.isInteger(target_lead_count)) insertRow.target_lead_count = target_lead_count;
+  if (Number.isInteger(min_priority_score)) insertRow.min_priority_score = min_priority_score;
+  if (Number.isInteger(max_search_batches)) insertRow.max_search_batches = max_search_batches;
+  if (Array.isArray(req.body?.excluded_acquirers)) insertRow.excluded_acquirers = req.body.excluded_acquirers;
+  if (typeof req.body?.require_independent === 'boolean') insertRow.require_independent = req.body.require_independent;
+  if (Array.isArray(lead_sources) && lead_sources.length) insertRow.lead_sources = lead_sources;
+  if (apollo_filter_json) insertRow.apollo_filter_json = apollo_filter_json;
+  if (apollo_list_id) insertRow.apollo_list_id = apollo_list_id;
+  if (apollo_list_name) insertRow.apollo_list_name = apollo_list_name;
+
+  const { data, error } = await supabase
+    .from('campaigns')
+    .insert(insertRow)
+    .select()
+    .single();
+  if (error) return res.status(500).json({ error: `Create failed: ${error.message}` });
+  res.json(data);
+}));
+
+campaignsRouter.get('/', wrap(async (req, res) => {
+  const { data: campaigns, error } = await supabase
+    .from('campaigns')
+    .select('*')
+    .order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ error: `List failed: ${error.message}` });
+
+  const ids = campaigns.map((c) => c.id);
+  let stats = {};
+  if (ids.length) {
+    const { data: leads } = await supabase
+      .from('leads')
+      .select('campaign_id, status, pass_fail')
+      .in('campaign_id', ids);
+    for (const id of ids) stats[id] = { leads: 0, reached: 0, connected: 0 };
+    for (const l of leads || []) {
+      if (l.pass_fail === 'FAIL') continue;
+      const s = stats[l.campaign_id];
+      if (!s) continue;
+      s.leads++;
+      if (['emailed', 'called', 'voicemail', 'connected', 'meeting'].includes(l.status)) s.reached++;
+      if (['connected', 'meeting'].includes(l.status)) s.connected++;
+    }
+  }
+  res.json(campaigns.map((c) => ({ ...c, stats: stats[c.id] || { leads: 0, reached: 0, connected: 0 } })));
+}));
+
+campaignsRouter.get('/:id', wrap(async (req, res) => {
+  const { data: campaign, error } = await supabase
+    .from('campaigns')
+    .select('*')
+    .eq('id', req.params.id)
+    .single();
+  if (error) return res.status(404).json({ error: `Campaign not found: ${error.message}` });
+
+  const { data: leads, error: leadsErr } = await supabase
+    .from('leads')
+    .select('*')
+    .eq('campaign_id', req.params.id)
+    .order('priority_score', { ascending: false });
+  if (leadsErr) return res.status(500).json({ error: `Leads load failed: ${leadsErr.message}` });
+
+  const visible = (leads || []).filter((l) => l.pass_fail !== 'FAIL');
+
+  // Attach lead_owners per lead so the dashboard can render the multi-owner
+  // section without an extra round-trip. The Owners tab uses the same data,
+  // joined flat with company info.
+  let ownersByLead = new Map();
+  if (visible.length) {
+    const { data: owners } = await supabase
+      .from('lead_owners')
+      .select('*')
+      .in('lead_id', visible.map((l) => l.id));
+    for (const o of owners || []) {
+      if (!ownersByLead.has(o.lead_id)) ownersByLead.set(o.lead_id, []);
+      ownersByLead.get(o.lead_id).push(o);
+    }
+  }
+  for (const l of visible) l.owners = ownersByLead.get(l.id) || [];
+
+  res.json({ ...campaign, leads: visible });
+}));
+
+campaignsRouter.patch('/:id', wrap(async (req, res) => {
+  const allowed = [
+    'name', 'status', 'sequence_config', 'email_templates', 'vm_script', 'vm_scripts', 'prompt',
+    'target_lead_count', 'min_priority_score', 'max_search_batches',
+    'excluded_acquirers', 'require_independent',
+    'lead_sources', 'apollo_filter_json', 'apollo_list_id', 'apollo_list_name',
+  ];
+  // Fields that freeze once Apollo sequence is created (locked_at set)
+  const lockedFields = ['sequence_config', 'email_templates', 'vm_script', 'vm_scripts'];
+
+  const update = {};
+  for (const k of allowed) if (k in (req.body || {})) update[k] = req.body[k];
+  if (!Object.keys(update).length) return res.status(400).json({ error: 'No updatable fields provided' });
+
+  // If any locked field is in the patch, check the campaign isn't already locked
+  if (lockedFields.some((f) => f in update)) {
+    const { data: existing } = await supabase
+      .from('campaigns')
+      .select('locked_at')
+      .eq('id', req.params.id)
+      .single();
+    if (existing?.locked_at) {
+      return res.status(409).json({
+        error: 'Outreach Content and Sequence Builder are locked once a campaign is launched. Apollo holds the source of truth for the sequence — create a new campaign to use different templates.',
+      });
+    }
+  }
+
+  const { data, error } = await supabase
+    .from('campaigns')
+    .update(update)
+    .eq('id', req.params.id)
+    .select()
+    .single();
+  if (error) return res.status(500).json({ error: `Update failed: ${error.message}` });
+
+  // Mirror status changes to Apollo via approve/abort (pause is a deactivation,
+  // NOT an archive — archive is reserved for the delete flow). Best-effort.
+  if ('status' in update && data.apollo_sequence_id) {
+    const active = data.status === 'running';
+    setSequenceActive(data.apollo_sequence_id, active)
+      .then((r) => {
+        if (!r.ok) console.warn('[campaigns] Apollo activate-sync failed', r.error);
+      })
+      .catch((e) => console.warn('[campaigns] Apollo activate-sync threw', e.message));
+  }
+
+  res.json(data);
+}));
+
+// Re-fire Apollo's async waterfall reveal for every owner in this campaign
+// that's still missing email or phone. The launch pipeline already runs this
+// once per owner — this manual button is for owners that came in via late
+// edits or the rediscover-owners script. Results land at
+// /api/apollo/enrichment-webhook over the next several minutes.
+campaignsRouter.post('/:id/reveal-contacts', wrap(async (req, res) => {
+  const base = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
+  if (!base) return res.status(500).json({ error: 'PUBLIC_BASE_URL must be set for Apollo to deliver the webhook callback' });
+  const webhookUrl = `${base}/api/apollo/enrichment-webhook`;
+
+  // Join owners with their lead's company_url so we know the domain.
+  const { data: leads } = await supabase
+    .from('leads')
+    .select('id, company_url')
+    .eq('campaign_id', req.params.id);
+  if (!leads?.length) return res.json({ ok: true, queued: 0, total: 0, message: 'No leads in this campaign yet' });
+
+  const leadById = new Map(leads.map((l) => [l.id, l]));
+  const { data: owners, error } = await supabase
+    .from('lead_owners')
+    .select('id, lead_id, first_name, last_name, apollo_contact_id, linkedin_url, email, phone')
+    .in('lead_id', leads.map((l) => l.id))
+    .or('email.is.null,phone.is.null');
+  if (error) return res.status(500).json({ error: `Owners lookup failed: ${error.message}` });
+  if (!owners?.length) return res.json({ ok: true, queued: 0, total: 0, message: 'All owners already have email and phone' });
+
+  function domainFromUrl(url) {
+    if (!url) return null;
+    const withProto = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+    try { return new URL(withProto).hostname.replace(/^www\./, ''); } catch { return null; }
+  }
+
+  const CONCURRENCY = 8;
+  let queued = 0, skipped = 0, failed = 0;
+
+  async function fireOne(owner) {
+    const lead = leadById.get(owner.lead_id);
+    const domain = domainFromUrl(lead?.company_url);
+    if (!owner.apollo_contact_id && (!owner.first_name || !domain)) { skipped++; return; }
+    const body = {
+      webhook_url: webhookUrl,
+      reveal_personal_emails: true,
+      reveal_phone_number: true,
+      run_waterfall_email: true,
+      run_waterfall_phone: true,
+    };
+    if (owner.apollo_contact_id) body.id = owner.apollo_contact_id;
+    if (owner.first_name) body.first_name = owner.first_name;
+    if (owner.last_name) body.last_name = owner.last_name;
+    if (domain) body.domain = domain;
+    if (owner.linkedin_url) body.linkedin_url = owner.linkedin_url;
+
+    try {
+      const { data } = await axios.post('https://api.apollo.io/api/v1/people/match', body, {
+        headers: { 'X-Api-Key': process.env.APOLLO_API_KEY, 'Content-Type': 'application/json' },
+        timeout: 30_000,
+      });
+      const newId = data?.person?.id;
+      if (newId && newId !== owner.apollo_contact_id) {
+        await supabase.from('lead_owners').update({ apollo_contact_id: newId }).eq('id', owner.id);
+      }
+      queued++;
+    } catch (e) {
+      failed++;
+      console.warn('[reveal-contacts] failed', owner.first_name, e.response?.data?.error || e.message);
+    }
+  }
+
+  let i = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(CONCURRENCY, owners.length) }, async () => {
+      while (i < owners.length) {
+        const owner = owners[i++];
+        await fireOne(owner);
+      }
+    })
+  );
+
+  res.json({
+    ok: true,
+    total: owners.length,
+    queued,
+    skipped,
+    failed,
+    message: `Queued ${queued}/${owners.length} owner reveals. Results will populate via webhook over the next few minutes — refresh the page to see new emails/phones as they arrive.`,
+  });
+}));
+
+// Delete a campaign: deactivate + archive in Apollo, then remove our row (cascade
+// drops leads + call_logs via FK). Best-effort on Apollo side — if the API call
+// fails, we still remove the local row so the dashboard isn't left in a stuck state.
+campaignsRouter.delete('/:id', wrap(async (req, res) => {
+  const { data: campaign } = await supabase
+    .from('campaigns')
+    .select('id, apollo_sequence_id')
+    .eq('id', req.params.id)
+    .single();
+  if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+
+  if (campaign.apollo_sequence_id) {
+    // Abort first (so no more sends fire during the archive transition), then archive.
+    const abortR = await setSequenceActive(campaign.apollo_sequence_id, false);
+    if (!abortR.ok) console.warn('[campaigns] Apollo abort-on-delete failed', abortR.error);
+    const archR = await archiveSequence(campaign.apollo_sequence_id);
+    if (!archR.ok) console.warn('[campaigns] Apollo archive-on-delete failed', archR.error);
+  }
+
+  const { error } = await supabase.from('campaigns').delete().eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: `Delete failed: ${error.message}` });
+  res.json({ ok: true });
+}));
+
+// ---------- prompt generation + launch ----------
+
+campaignsRouter.post('/:id/generate-prompts', wrap(async (req, res) => {
+  try {
+    const queries = await generatePromptsForCampaign(req.params.id);
+    res.json({ queries });
+  } catch (e) {
+    res.status(500).json({ error: `Prompt generation failed: ${e.message}` });
+  }
+}));
+
+campaignsRouter.post('/:id/launch', wrap(async (req, res) => {
+  // fire and forget — long-running pipeline runs in the background
+  const queries = req.body?.queries || null;
+  const skipEnrichment = !!req.body?.skip_enrichment;
+  const opts = {
+    skipEnrichment,
+    csvStagingId: req.body?.csv_staging_id || null,
+  };
+  res.json({ ok: true, message: 'Campaign launching in background', skip_enrichment: skipEnrichment });
+  launchCampaign(req.params.id, queries, opts).catch((e) => {
+    console.error('[launch] failed', req.params.id, e);
+  });
+}));
+
+campaignsRouter.get('/:id/progress', (req, res) => {
+  const p = getProgress(req.params.id);
+  res.json(p || { stage: null });
+});
+
+// ---------- call queue + dialer ----------
+
+campaignsRouter.get('/:id/call-queue', wrap(async (req, res) => {
+  // Leads whose current sequence step is a call and which haven't been called for it yet.
+  const { data: campaign, error } = await supabase
+    .from('campaigns')
+    .select('*')
+    .eq('id', req.params.id)
+    .single();
+  if (error) return res.status(404).json({ error: `Campaign not found: ${error.message}` });
+
+  const seq = campaign.sequence_config || [];
+  const { data: leads } = await supabase
+    .from('leads')
+    .select('*')
+    .eq('campaign_id', req.params.id)
+    .order('priority_score', { ascending: false });
+
+  const queue = (leads || []).filter((l) => {
+    if (!l.phone) return false;
+    if (l.pass_fail === 'FAIL') return false;
+    const step = seq[l.sequence_step];
+    if (!step || !step.active || step.type !== 'call') return false;
+    if (l.status === 'connected' || l.status === 'meeting' || l.status === 'passed') return false;
+    return true;
+  });
+
+  res.json({ queue });
+}));
+
+// Session prep for the browser dialer. The browser SDK places the outbound
+// call itself — this endpoint pre-synthesizes the audio assets (announcement
+// + per-lead voicemail) and returns the prepared queue with a session_id used
+// to route SSE events back to this dialer instance.
+campaignsRouter.post('/:id/dial', wrap(async (req, res) => {
+  const { data: campaign, error } = await supabase
+    .from('campaigns')
+    .select('*')
+    .eq('id', req.params.id)
+    .single();
+  if (error) return res.status(404).json({ error: error.message });
+
+  const { data: leads } = await supabase
+    .from('leads')
+    .select('*')
+    .eq('campaign_id', req.params.id)
+    .order('priority_score', { ascending: false });
+
+  const seq = campaign.sequence_config || [];
+  const queue = (leads || []).filter((l) => {
+    if (!l.phone) return false;
+    if (l.pass_fail === 'FAIL') return false;
+    const step = seq[l.sequence_step];
+    return step?.active && step.type === 'call' && !['connected', 'meeting', 'passed'].includes(l.status);
+  });
+
+  const leadIds = (req.body?.lead_ids && Array.isArray(req.body.lead_ids))
+    ? req.body.lead_ids
+    : queue.map((l) => l.id);
+  const targets = queue.filter((l) => leadIds.includes(l.id));
+  if (!targets.length) return res.json({ ok: true, session_id: null, leads: [] });
+
+  function vmScriptFor(lead) {
+    const callsBefore = seq.slice(0, lead.sequence_step + 1).filter((s) => s?.type === 'call').length;
+    const callOrdinal = Math.max(0, callsBefore - 1);
+    const arr = campaign.vm_scripts || [];
+    return arr[callOrdinal] || arr[0] || campaign.vm_script || '';
+  }
+
+  for (const lead of targets) {
+    try {
+      if (!audioFileExists(lead.id)) {
+        const firstName = (lead.contact_name || '').split(' ')[0] || 'there';
+        const tpl = vmScriptFor(lead);
+        const text = renderScript(tpl, {
+          FIRST_NAME: firstName,
+          COMPANY: lead.company_name || '',
+          INDUSTRY: lead.industry || '',
+          CONTACT_NAME: lead.contact_name || '',
+        });
+        if (text) await synthesizeVoicemail(lead.id, text);
+      }
+      if (!announceFileExists(lead.id)) {
+        await synthesizeAnnouncement(lead.id, lead);
+      }
+    } catch (e) {
+      console.warn('[dial] audio synth failed', lead.id, e.message);
+    }
+  }
+
+  const session_id = crypto.randomUUID();
+  res.json({ ok: true, session_id, leads: targets });
+}));
+
+// PATCH outcome from the LogOutcomeModal after a connected call. Keyed by
+// the dialed-leg Twilio Call SID (which the browser SDK exposes on disconnect).
+campaignsRouter.patch('/call-logs/:callSid/outcome', wrap(async (req, res) => {
+  const { outcome_label, notes, talk_seconds } = req.body || {};
+  const update = {};
+  if (outcome_label) update.outcome_label = outcome_label;
+  if (typeof notes === 'string') update.notes = notes;
+  if (Number.isFinite(talk_seconds)) update.talk_seconds = talk_seconds;
+  if (!Object.keys(update).length) return res.status(400).json({ error: 'no fields to update' });
+
+  const { data: existing } = await supabase
+    .from('call_logs')
+    .select('id')
+    .eq('twilio_call_sid', req.params.callSid)
+    .maybeSingle();
+  if (existing?.id) {
+    const { error: e } = await supabase.from('call_logs').update(update).eq('id', existing.id);
+    if (e) return res.status(500).json({ error: e.message });
+  } else {
+    // Status callback hasn't landed yet — create a placeholder with the sid
+    // so the future status row finds & updates this one instead of duplicating.
+    const { error: e } = await supabase.from('call_logs').insert({
+      twilio_call_sid: req.params.callSid,
+      ...update,
+    });
+    if (e) return res.status(500).json({ error: e.message });
+  }
+  res.json({ ok: true });
+}));
