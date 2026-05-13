@@ -116,7 +116,10 @@ apolloRouter.post('/enrichment-webhook', async (req, res) => {
       }
       const ownerUpdate = {};
       if (update.email && !owner.email) ownerUpdate.email = update.email;
-      if (update.phone && !owner.phone) ownerUpdate.phone = update.phone;
+      if (update.phone && !owner.phone) {
+        ownerUpdate.phone = update.phone;
+        ownerUpdate.phone_status = 'verified';
+      }
       if (Object.keys(ownerUpdate).length) ownerUpdate.enrichment_source = 'apollo';
       if (!Object.keys(ownerUpdate).length) {
         console.log(`[apollo/webhook] owner ${owner.id} already has email/phone — skipping`);

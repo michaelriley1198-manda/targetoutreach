@@ -11,9 +11,7 @@ import {
   getLabelCompanies,
   orgEnrich,
   mapApolloOrgToLead,
-  createSequenceFromCampaign,
-  addContactToSequence,
-  archiveSequence,
+  getContactById,
 } from '../services/apollo.js';
 import { mapRowsToLeads } from '../services/csv.js';
 import { discoverOwners } from '../services/owners.js';
@@ -299,14 +297,16 @@ async function apolloRevealOwner({ firstName, lastName, linkedinUrl, domain, exi
     first_name: firstName,
     domain,
     reveal_personal_emails: true,
-    reveal_phone_number: true,
-    run_waterfall_email: true,
-    run_waterfall_phone: true,
   };
   if (lastName) body.last_name = lastName;
   if (linkedinUrl) body.linkedin_url = linkedinUrl;
   if (existingApolloId) body.id = existingApolloId;
-  if (webhookUrl) body.webhook_url = webhookUrl;
+  if (webhookUrl) {
+    body.webhook_url = webhookUrl;
+    body.reveal_phone_number = true;
+    body.run_waterfall_email = true;
+    body.run_waterfall_phone = true;
+  }
 
   try {
     const { data } = await axios.post(`${APOLLO_BASE}/people/match`, body, {
@@ -644,6 +644,42 @@ export async function launchCampaign(campaignId, providedQueries = null, opts = 
       }
     );
 
+    // ----- Stage 7a: Apollo direct contact fetch for known IDs (zero credits) --
+    // Reads whatever Apollo already has stored, including manually-unlocked phones.
+    // Runs before the waterfall so we only charge credits for contacts truly missing data.
+    const directFetchTargets = allOwnerRows.filter((o) => o.apollo_contact_id && (!o.email || !o.phone));
+    if (directFetchTargets.length) {
+      onProgress({
+        stage: 'reveal',
+        message: `Apollo direct fetch for ${directFetchTargets.length} known contacts`,
+        current: 0, total: directFetchTargets.length,
+      });
+      let dfOk = 0, dfFail = 0;
+      await runPool(
+        directFetchTargets,
+        REVEAL_CONCURRENCY,
+        async (owner) => {
+          const r = await getContactById(owner.apollo_contact_id);
+          if (!r) return null;
+          const update = {};
+          if (r.email && !owner.email) update.email = r.email;
+          if (r.phone && !owner.phone) update.phone = r.phone;
+          if (r.phone_status && !owner.phone_status) update.phone_status = r.phone_status;
+          if (r.email_status && !owner.email_status) update.email_status = r.email_status;
+          if (Object.keys(update).length) {
+            if (update.email || update.phone) update.enrichment_source = 'apollo';
+            await supabase.from('lead_owners').update(update).eq('id', owner.id);
+            Object.assign(owner, update);
+          }
+          return r;
+        },
+        ({ ok }) => {
+          if (ok) dfOk++; else dfFail++;
+          onProgress({ current: dfOk + dfFail });
+        }
+      );
+    }
+
     // ----- Stage 7: Apollo people-match reveal per owner (waterfall queued) ---
     const ownersToReveal = allOwnerRows.filter((o) => o.first_name && o._domain && (!o.email || !o.phone));
     onProgress({
@@ -736,56 +772,7 @@ export async function launchCampaign(campaignId, providedQueries = null, opts = 
       }).eq('id', leadId);
     }
 
-    // ----- Stage 10: Apollo sequence + add ALL qualified owners --------------
-    if (!campaign.apollo_sequence_id) {
-      onProgress({ stage: 'sequence', message: 'Creating Apollo sequence' });
-      const { id: seqId, error: seqErr } = await createSequenceFromCampaign({
-        name: campaign.name,
-        sequence_config: campaign.sequence_config,
-        email_templates: campaign.email_templates,
-      });
-      if (seqId && !seqErr) {
-        await supabase
-          .from('campaigns')
-          .update({ apollo_sequence_id: seqId, locked_at: new Date().toISOString() })
-          .eq('id', campaignId);
-
-        // Add every qualified owner: must have apollo_contact_id AND (email OR phone).
-        const qualified = allOwnerRows.filter(
-          (o) => o.apollo_contact_id && (o.email || o.phone)
-        );
-        onProgress({
-          message: `Adding ${qualified.length} owners to Apollo sequence`,
-          current: 0, total: qualified.length,
-        });
-        let added = 0, addFailed = 0;
-        for (const owner of qualified) {
-          const r = await addContactToSequence({
-            sequenceId: seqId,
-            apolloContactId: owner.apollo_contact_id,
-            sendFromAccountId: process.env.APOLLO_SEND_FROM_ACCOUNT_ID,
-          });
-          if (r.ok) {
-            added++;
-            const memberId = r.data?.contacts?.[0]?.id || r.data?.emailer_campaign?.contacts?.[0]?.id || null;
-            if (memberId) {
-              await supabase.from('lead_owners').update({ apollo_sequence_member_id: memberId }).eq('id', owner.id);
-            }
-          } else {
-            addFailed++;
-          }
-          onProgress({ current: added + addFailed });
-        }
-        if (addFailed) errors.push(`Apollo: ${addFailed} contact(s) could not be added to the sequence.`);
-      } else if (seqErr) {
-        if (seqId) {
-          archiveSequence(seqId).catch(() => {});
-          errors.push(`Apollo sequence creation partially failed and was archived: ${seqErr}.`);
-        } else {
-          errors.push(`Apollo sequence creation failed: ${seqErr || 'unknown error'}`);
-        }
-      }
-    }
+    // Stage 10 (Apollo sequence creation) removed — outreach is managed in-tool.
 
     await supabase.from('campaigns').update({ status: 'running' }).eq('id', campaignId);
     onProgress({

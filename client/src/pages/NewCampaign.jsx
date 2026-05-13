@@ -332,7 +332,7 @@ function ContentReviewStep({ campaign, onCampaignUpdate, onLaunch, onBack, busy:
   return (
     <div className="content-review">
       <h2>Review Outreach Content</h2>
-      <p className="muted">Once launched, the Apollo sequence is created and these are locked.</p>
+      <p className="muted">Configure your voicemail script for each call step, then launch.</p>
       {err && <div className="error">{err}</div>}
 
       <div className="step-editors">
@@ -381,13 +381,12 @@ function ContentReviewStep({ campaign, onCampaignUpdate, onLaunch, onBack, busy:
       </div>
 
       <div className="row" style={{ marginTop: 12 }}>
-        <button className="ghost" onClick={() => addStep('email')}>+ Add email</button>
-        <button className="ghost" onClick={() => addStep('call')}>+ Add call</button>
+        <button className="ghost" onClick={() => addStep('call')}>+ Add call step</button>
       </div>
 
       <label className="row" style={{ marginTop: 12, gap: 8, alignItems: 'center' }}>
         <input type="checkbox" checked={skipEnrichment} onChange={(e) => setSkipEnrichment(e.target.checked)} />
-        <span>Test mode: company search only (skip Apollo contact enrichment + sequence creation)</span>
+        <span>Test mode: company search only (skip contact enrichment)</span>
       </label>
 
       <div className="row save-row">

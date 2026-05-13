@@ -32,6 +32,28 @@ function apolloErr(e) {
 }
 
 // ----------------------------------------------------------------------------
+// Direct contact fetch — reads whatever Apollo already has stored (including
+// manually-unlocked phones). Zero credits; call before any waterfall attempt.
+// ----------------------------------------------------------------------------
+export async function getContactById(contactId) {
+  if (!contactId) return null;
+  try {
+    const { data } = await axios.get(`${BASE}/contacts/${contactId}`,
+      { headers: headers(), timeout: TIMEOUT });
+    const c = data?.contact || {};
+    return {
+      phone: c.sanitized_phone || c.phone_numbers?.[0]?.sanitized_number || c.phone_numbers?.[0]?.raw_number || null,
+      email: c.email || c.personal_emails?.[0] || null,
+      phone_status: c.phone_numbers?.[0]?.status || null,
+      email_status: c.email_status || null,
+    };
+  } catch (e) {
+    console.warn('[apollo] getContactById failed', contactId, apolloErr(e));
+    return null;
+  }
+}
+
+// ----------------------------------------------------------------------------
 // Enrichment — find owner contact + Apollo contact id
 // ----------------------------------------------------------------------------
 export async function findOwner(companyUrl) {

@@ -210,15 +210,29 @@ twilioRouter.post('/status', async (req, res) => {
     }
 
     const newStatus = outcome === 'connected' ? 'connected' : outcome === 'voicemail' ? 'voicemail' : 'called';
+    const now = new Date().toISOString();
+    const seq = lead?.campaign_id
+      ? (await supabase.from('campaigns').select('sequence_config').eq('id', lead.campaign_id).single())?.data?.sequence_config || []
+      : [];
+    const currentStep = lead?.sequence_step || 0;
+    // Advance by 1; if we have the sequence cap at its length (so the lead falls off the queue naturally)
+    const nextStep = seq.length > 0 ? Math.min(currentStep + 1, seq.length) : currentStep + 1;
     await supabase
       .from('leads')
       .update({
         status: newStatus,
         last_action: outcome,
-        last_action_date: new Date().toISOString(),
-        sequence_step: (lead?.sequence_step || 0) + 1,
+        last_action_date: now,
+        last_called_at: now,
+        sequence_step: nextStep,
       })
       .eq('id', leadId);
+    // Mirror to lead_owners (only rows not manually overridden)
+    await supabase
+      .from('lead_owners')
+      .update({ status: newStatus, sequence_step: nextStep })
+      .eq('lead_id', leadId)
+      .is('stage_overridden_at', null);
 
     if (lead?.apollo_contact_id) {
       logCallToApollo({

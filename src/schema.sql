@@ -142,6 +142,9 @@ alter table call_logs add column if not exists notes           text;
 alter table call_logs add column if not exists talk_seconds    integer;
 alter table call_logs add column if not exists campaign_id     uuid references campaigns(id) on delete cascade;
 create unique index if not exists call_logs_twilio_sid_idx on call_logs(twilio_call_sid) where twilio_call_sid is not null;
+
+-- Tracks when a lead was last called; drives wait_days eligibility in the call queue.
+alter table leads add column if not exists last_called_at timestamptz;
 create index if not exists call_logs_campaign_idx on call_logs(campaign_id);
 
 -- CSV staging: between the wizard's "preview upload" step and "launch", we

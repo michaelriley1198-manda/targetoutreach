@@ -4,7 +4,8 @@ import { generatePromptsForCampaign, launchCampaign } from '../pipeline/run.js';
 import { getProgress } from '../pipeline/progress.js';
 import { synthesizeVoicemail, renderScript, audioFileExists, synthesizeAnnouncement, announceFileExists } from '../services/elevenlabs.js';
 import crypto from 'node:crypto';
-import { setSequenceActive, archiveSequence } from '../services/apollo.js';
+import { setSequenceActive, archiveSequence, getContactById } from '../services/apollo.js';
+import { fallbackContact as leadMagicFallback } from '../services/leadmagic.js';
 import axios from 'axios';
 
 export const campaignsRouter = express.Router();
@@ -13,28 +14,20 @@ export const campaignsRouter = express.Router();
 // with a JSON body. Without this, async throws hang the request.
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
-// Day-0 / Day-3 / Day-5 / Day-8 / Day-12 — wait_days is relative to the previous step
+// wait_days is relative to the previous step
 const DEFAULT_SEQUENCE = [
-  { type: 'email', wait_days: 0, active: true, label: 'Initial email' },
-  { type: 'call',  wait_days: 3, active: true, label: 'Call + voicemail' },
-  { type: 'email', wait_days: 2, active: true, label: 'Bump email' },
-  { type: 'call',  wait_days: 3, active: true, label: 'Second call + VM' },
-  { type: 'email', wait_days: 4, active: true, label: 'Final email' },
+  { type: 'call', wait_days: 0, active: true, label: 'Initial call' },
+  { type: 'call', wait_days: 3, active: true, label: 'Follow-up call' },
+  { type: 'call', wait_days: 5, active: true, label: 'Final call' },
 ];
 
-const DEFAULT_TEMPLATES = [
-  { subject: 'Quick question about [COMPANY]', body: 'Hi [FIRST_NAME],\n\nI lead acquisitions at our firm and have been following [COMPANY]. Would you be open to a brief intro call?\n\nBest,\n[SENDER]' },
-  { subject: 'Following up — [COMPANY]', body: 'Hi [FIRST_NAME],\n\nWanted to bump my last note. Happy to share more about how we work.\n\nBest,\n[SENDER]' },
-  { subject: 'Last note — [COMPANY]', body: 'Hi [FIRST_NAME],\n\nIf the timing isn\'t right, totally understand. I\'ll keep an eye on [COMPANY] and reach back out down the road.\n\nBest,\n[SENDER]' },
-];
-
-const DEFAULT_VM_SCRIPT = "Hi [FIRST_NAME], this is calling about [COMPANY]. I lead acquisitions at our firm and wanted to share a quick thought about [INDUSTRY]. I'll send a follow-up email — talk soon.";
+const DEFAULT_VM_SCRIPT = "Hi [FIRST_NAME], this is Michael calling about [COMPANY]. I lead acquisitions at Boyne Capital and wanted to connect briefly about a potential opportunity. I'll follow up — thanks.";
 
 // ---------- create / list ----------
 
 campaignsRouter.post('/', wrap(async (req, res) => {
   const {
-    name, prompt, sequence_config, email_templates, vm_script,
+    name, prompt, sequence_config, vm_script,
     target_lead_count, min_priority_score, max_search_batches,
     lead_sources, apollo_filter_json, apollo_list_id, apollo_list_name,
   } = req.body || {};
@@ -45,7 +38,6 @@ campaignsRouter.post('/', wrap(async (req, res) => {
     prompt,
     status: 'paused',
     sequence_config: sequence_config?.length ? sequence_config : DEFAULT_SEQUENCE,
-    email_templates: email_templates?.length ? email_templates : DEFAULT_TEMPLATES,
     vm_script: vm_script || DEFAULT_VM_SCRIPT,
   };
   if (Number.isInteger(target_lead_count)) insertRow.target_lead_count = target_lead_count;
@@ -137,26 +129,9 @@ campaignsRouter.patch('/:id', wrap(async (req, res) => {
     'excluded_acquirers', 'require_independent',
     'lead_sources', 'apollo_filter_json', 'apollo_list_id', 'apollo_list_name',
   ];
-  // Fields that freeze once Apollo sequence is created (locked_at set)
-  const lockedFields = ['sequence_config', 'email_templates', 'vm_script', 'vm_scripts'];
-
   const update = {};
   for (const k of allowed) if (k in (req.body || {})) update[k] = req.body[k];
   if (!Object.keys(update).length) return res.status(400).json({ error: 'No updatable fields provided' });
-
-  // If any locked field is in the patch, check the campaign isn't already locked
-  if (lockedFields.some((f) => f in update)) {
-    const { data: existing } = await supabase
-      .from('campaigns')
-      .select('locked_at')
-      .eq('id', req.params.id)
-      .single();
-    if (existing?.locked_at) {
-      return res.status(409).json({
-        error: 'Outreach Content and Sequence Builder are locked once a campaign is launched. Apollo holds the source of truth for the sequence — create a new campaign to use different templates.',
-      });
-    }
-  }
 
   const { data, error } = await supabase
     .from('campaigns')
@@ -165,17 +140,6 @@ campaignsRouter.patch('/:id', wrap(async (req, res) => {
     .select()
     .single();
   if (error) return res.status(500).json({ error: `Update failed: ${error.message}` });
-
-  // Mirror status changes to Apollo via approve/abort (pause is a deactivation,
-  // NOT an archive — archive is reserved for the delete flow). Best-effort.
-  if ('status' in update && data.apollo_sequence_id) {
-    const active = data.status === 'running';
-    setSequenceActive(data.apollo_sequence_id, active)
-      .then((r) => {
-        if (!r.ok) console.warn('[campaigns] Apollo activate-sync failed', r.error);
-      })
-      .catch((e) => console.warn('[campaigns] Apollo activate-sync threw', e.message));
-  }
 
   res.json(data);
 }));
@@ -187,20 +151,19 @@ campaignsRouter.patch('/:id', wrap(async (req, res) => {
 // /api/apollo/enrichment-webhook over the next several minutes.
 campaignsRouter.post('/:id/reveal-contacts', wrap(async (req, res) => {
   const base = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
-  if (!base) return res.status(500).json({ error: 'PUBLIC_BASE_URL must be set for Apollo to deliver the webhook callback' });
-  const webhookUrl = `${base}/api/apollo/enrichment-webhook`;
+  const webhookUrl = base ? `${base}/api/apollo/enrichment-webhook` : null;
 
-  // Join owners with their lead's company_url so we know the domain.
+  // Join owners with their lead's company_url + existing contact fields.
   const { data: leads } = await supabase
     .from('leads')
-    .select('id, company_url')
+    .select('id, company_url, phone, email')
     .eq('campaign_id', req.params.id);
   if (!leads?.length) return res.json({ ok: true, queued: 0, total: 0, message: 'No leads in this campaign yet' });
 
   const leadById = new Map(leads.map((l) => [l.id, l]));
   const { data: owners, error } = await supabase
     .from('lead_owners')
-    .select('id, lead_id, first_name, last_name, apollo_contact_id, linkedin_url, email, phone')
+    .select('id, lead_id, first_name, last_name, apollo_contact_id, linkedin_url, email, phone, phone_status, email_status')
     .in('lead_id', leads.map((l) => l.id))
     .or('email.is.null,phone.is.null');
   if (error) return res.status(500).json({ error: `Owners lookup failed: ${error.message}` });
@@ -212,6 +175,18 @@ campaignsRouter.post('/:id/reveal-contacts', wrap(async (req, res) => {
     try { return new URL(withProto).hostname.replace(/^www\./, ''); } catch { return null; }
   }
 
+  // Mirror a phone/email update back to the lead row so the dialer picks it up.
+  async function mirrorToLead(leadId, { phone, email, phone_status, email_status } = {}) {
+    const lead = leadById.get(leadId);
+    if (!lead) return;
+    const patch = {};
+    if (phone && !lead.phone) { patch.phone = phone; if (phone_status) patch.phone_status = phone_status; }
+    if (email && !lead.email) { patch.email = email; if (email_status) patch.email_status = email_status; }
+    if (!Object.keys(patch).length) return;
+    Object.assign(lead, patch);
+    await supabase.from('leads').update(patch).eq('id', leadId);
+  }
+
   const CONCURRENCY = 8;
   let queued = 0, skipped = 0, failed = 0;
 
@@ -219,32 +194,74 @@ campaignsRouter.post('/:id/reveal-contacts', wrap(async (req, res) => {
     const lead = leadById.get(owner.lead_id);
     const domain = domainFromUrl(lead?.company_url);
     if (!owner.apollo_contact_id && (!owner.first_name || !domain)) { skipped++; return; }
-    const body = {
-      webhook_url: webhookUrl,
-      reveal_personal_emails: true,
-      reveal_phone_number: true,
-      run_waterfall_email: true,
-      run_waterfall_phone: true,
-    };
-    if (owner.apollo_contact_id) body.id = owner.apollo_contact_id;
-    if (owner.first_name) body.first_name = owner.first_name;
-    if (owner.last_name) body.last_name = owner.last_name;
-    if (domain) body.domain = domain;
-    if (owner.linkedin_url) body.linkedin_url = owner.linkedin_url;
 
-    try {
-      const { data } = await axios.post('https://api.apollo.io/api/v1/people/match', body, {
-        headers: { 'X-Api-Key': process.env.APOLLO_API_KEY, 'Content-Type': 'application/json' },
-        timeout: 30_000,
-      });
-      const newId = data?.person?.id;
-      if (newId && newId !== owner.apollo_contact_id) {
-        await supabase.from('lead_owners').update({ apollo_contact_id: newId }).eq('id', owner.id);
+    // Pass 1: Apollo direct GET — reads already-stored data, zero credits
+    if (owner.apollo_contact_id) {
+      const r = await getContactById(owner.apollo_contact_id).catch(() => null);
+      if (r) {
+        const ownerPatch = {};
+        if (r.phone && !owner.phone) { ownerPatch.phone = r.phone; if (r.phone_status) ownerPatch.phone_status = r.phone_status; }
+        if (r.email && !owner.email) { ownerPatch.email = r.email; if (r.email_status) ownerPatch.email_status = r.email_status; }
+        if (Object.keys(ownerPatch).length) {
+          ownerPatch.enrichment_source = 'apollo';
+          await supabase.from('lead_owners').update(ownerPatch).eq('id', owner.id);
+          Object.assign(owner, ownerPatch);
+          await mirrorToLead(owner.lead_id, ownerPatch);
+        }
       }
+    }
+
+    // Pass 2: Apollo waterfall — async backstop, only if still missing and webhook is available
+    if ((!owner.phone || !owner.email) && webhookUrl) {
+      const body = {
+        webhook_url: webhookUrl,
+        reveal_personal_emails: true,
+        reveal_phone_number: true,
+        run_waterfall_email: true,
+        run_waterfall_phone: true,
+      };
+      if (owner.apollo_contact_id) body.id = owner.apollo_contact_id;
+      if (owner.first_name) body.first_name = owner.first_name;
+      if (owner.last_name) body.last_name = owner.last_name;
+      if (domain) body.domain = domain;
+      if (owner.linkedin_url) body.linkedin_url = owner.linkedin_url;
+
+      try {
+        const { data } = await axios.post('https://api.apollo.io/api/v1/people/match', body, {
+          headers: { 'X-Api-Key': process.env.APOLLO_API_KEY, 'Content-Type': 'application/json' },
+          timeout: 30_000,
+        });
+        const p = data?.person || {};
+        const syncPatch = {};
+        const newId = p.id;
+        if (newId && newId !== owner.apollo_contact_id) syncPatch.apollo_contact_id = newId;
+        const syncPhone = p.sanitized_phone || p.phone_numbers?.[0]?.sanitized_number || p.phone_numbers?.[0]?.raw_number || null;
+        const syncEmail = p.email || p.personal_emails?.[0] || null;
+        if (syncPhone && !owner.phone) { syncPatch.phone = syncPhone; syncPatch.phone_status = 'verified'; }
+        if (syncEmail && !owner.email) syncPatch.email = syncEmail;
+        if (Object.keys(syncPatch).length) {
+          if (syncPatch.phone || syncPatch.email) syncPatch.enrichment_source = 'apollo';
+          await supabase.from('lead_owners').update(syncPatch).eq('id', owner.id);
+          Object.assign(owner, syncPatch);
+          await mirrorToLead(owner.lead_id, syncPatch);
+        }
+        queued++;
+      } catch (e) {
+        failed++;
+        console.warn('[reveal-contacts] apollo waterfall failed', owner.first_name, e.response?.data?.error || e.message);
+      }
+    } else {
       queued++;
-    } catch (e) {
-      failed++;
-      console.warn('[reveal-contacts] failed', owner.first_name, e.response?.data?.error || e.message);
+    }
+
+    // Pass 3: LeadMagic direct — synchronous, no credits, only if still missing
+    if ((!owner.phone || !owner.email) && owner.first_name && owner.last_name && domain) {
+      const lm = await leadMagicFallback(owner, { companyDomain: domain }).catch(() => null);
+      if (lm) {
+        await supabase.from('lead_owners').update(lm).eq('id', owner.id);
+        Object.assign(owner, lm);
+        await mirrorToLead(owner.lead_id, lm);
+      }
     }
   }
 
@@ -264,7 +281,7 @@ campaignsRouter.post('/:id/reveal-contacts', wrap(async (req, res) => {
     queued,
     skipped,
     failed,
-    message: `Queued ${queued}/${owners.length} owner reveals. Results will populate via webhook over the next few minutes — refresh the page to see new emails/phones as they arrive.`,
+    message: `Processed ${queued}/${owners.length} owners — direct Apollo fetch + LeadMagic ran synchronously; waterfall results (if any) arrive via webhook. Refresh to see updated phones.`,
   });
 }));
 
@@ -340,13 +357,22 @@ campaignsRouter.get('/:id/call-queue', wrap(async (req, res) => {
     .eq('campaign_id', req.params.id)
     .order('priority_score', { ascending: false });
 
+  const now = Date.now();
   const queue = (leads || []).filter((l) => {
     if (!l.phone) return false;
     if (l.pass_fail === 'FAIL') return false;
     const step = seq[l.sequence_step];
     if (!step || !step.active || step.type !== 'call') return false;
     if (l.status === 'connected' || l.status === 'meeting' || l.status === 'passed') return false;
+    if (step.wait_days > 0 && l.last_called_at) {
+      const daysSince = (now - new Date(l.last_called_at)) / 86_400_000;
+      if (daysSince < step.wait_days) return false;
+    }
     return true;
+  }).map((l) => {
+    const step = seq[l.sequence_step];
+    const totalSteps = seq.length;
+    return { ...l, _step_index: l.sequence_step, _total_steps: totalSteps, _step_label: step?.label };
   });
 
   res.json({ queue });
@@ -371,11 +397,18 @@ campaignsRouter.post('/:id/dial', wrap(async (req, res) => {
     .order('priority_score', { ascending: false });
 
   const seq = campaign.sequence_config || [];
+  const nowMs = Date.now();
   const queue = (leads || []).filter((l) => {
     if (!l.phone) return false;
     if (l.pass_fail === 'FAIL') return false;
     const step = seq[l.sequence_step];
-    return step?.active && step.type === 'call' && !['connected', 'meeting', 'passed'].includes(l.status);
+    if (!step?.active || step.type !== 'call') return false;
+    if (['connected', 'meeting', 'passed'].includes(l.status)) return false;
+    if (step.wait_days > 0 && l.last_called_at) {
+      const daysSince = (nowMs - new Date(l.last_called_at)) / 86_400_000;
+      if (daysSince < step.wait_days) return false;
+    }
+    return true;
   });
 
   const leadIds = (req.body?.lead_ids && Array.isArray(req.body.lead_ids))

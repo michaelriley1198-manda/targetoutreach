@@ -1,9 +1,18 @@
-import { Fragment, useEffect, useRef, useState } from 'react';
+import { Component, Fragment, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api } from '../api.js';
 
+class ExpandErrorBoundary extends Component {
+  constructor(props) { super(props); this.state = { err: null }; }
+  static getDerivedStateFromError(e) { return { err: e }; }
+  render() {
+    if (this.state.err) return <div className="muted small warn">⚠ Could not render details: {this.state.err.message}</div>;
+    return this.props.children;
+  }
+}
+
 const TABS = ['Leads', 'Owners', 'Outreach Content', 'Sequence Builder'];
-const ACTIVE_STAGES = ['producers', 'merge', 'apollo_enrich', 'score', 'holistic', 'owners', 'reveal', 'leadmagic', 'sequence'];
+const ACTIVE_STAGES = ['producers', 'merge', 'apollo_enrich', 'score', 'holistic', 'owners', 'reveal', 'leadmagic'];
 
 const OWNER_STATUSES = ['new', 'emailed', 'called', 'voicemail', 'connected', 'meeting', 'passed'];
 
@@ -51,7 +60,7 @@ export default function CampaignDetail() {
   }
 
   async function deleteCampaign() {
-    if (!confirm(`Delete "${campaign.name}"? This deactivates and archives the Apollo sequence and removes all local leads. Cannot be undone.`)) return;
+    if (!confirm(`Delete "${campaign.name}"? This removes all leads and cannot be undone.`)) return;
     try {
       await api.deleteCampaign(id);
       nav('/campaigns');
@@ -122,35 +131,19 @@ function CampaignMeta({ campaign }) {
   const target = campaign.target_lead_count ?? 150;
   const minScore = campaign.min_priority_score ?? 50;
   const maxBatches = campaign.max_search_batches ?? 4;
-  const apolloId = campaign.apollo_sequence_id;
-  const apolloUrl = apolloId ? `https://app.apollo.io/#/emailer_campaigns/${apolloId}` : null;
+  const callSteps = (campaign.sequence_config || []).filter((s) => s?.type === 'call').length;
   return (
     <div className="meta-row">
       <span className="meta-chip">Target: <b>{target}</b></span>
       <span className="meta-chip">Min score: <b>{minScore}</b></span>
       <span className="meta-chip">Max batches: <b>{maxBatches}</b></span>
-      {apolloId ? (
-        <a href={apolloUrl} target="_blank" rel="noreferrer" className="meta-chip apollo-on">
-          Apollo: <b>{apolloId.slice(0, 8)}…</b> ↗
-        </a>
-      ) : (
-        <span className="meta-chip apollo-off">Apollo: not synced</span>
-      )}
-    </div>
-  );
-}
-
-function LockBanner() {
-  return (
-    <div className="lock-banner">
-      🔒 <b>Locked after launch.</b> Apollo holds the source of truth for this campaign's sequence and templates.
-      To use different templates, create a new campaign.
+      <span className="meta-chip">Sequence: <b>{callSteps} call{callSteps === 1 ? '' : 's'}</b></span>
     </div>
   );
 }
 
 function ProgressBanner({ progress }) {
-  const STAGE_ORDER = ['producers', 'merge', 'apollo_enrich', 'score', 'holistic', 'owners', 'reveal', 'leadmagic', 'sequence', 'done'];
+  const STAGE_ORDER = ['producers', 'merge', 'apollo_enrich', 'score', 'holistic', 'owners', 'reveal', 'leadmagic', 'done'];
   const STAGE_LABELS = {
     producers: 'Running producers (Exa / Apollo / CSV)',
     merge: 'Merging companies',
@@ -160,7 +153,6 @@ function ProgressBanner({ progress }) {
     owners: 'Discovering owners',
     reveal: 'Apollo contact reveal',
     leadmagic: 'LeadMagic auto-fallback',
-    sequence: 'Creating Apollo sequence',
     done: 'Done',
     error: 'Failed',
   };
@@ -267,6 +259,7 @@ function LeadsTab({ campaign, reload }) {
             <th>EBITDA</th>
             <th onClick={() => toggleSort('location')} className="sortable">Location{caret('location')}</th>
             <th onClick={() => toggleSort('status')} className="sortable col-status">Status{caret('status')}</th>
+            <th>Sequence</th>
             <th>Last Action</th>
             <th className="col-actions"></th>
           </tr>
@@ -312,6 +305,7 @@ function LeadsTab({ campaign, reload }) {
                 <td>{l.ebitda || <span className="muted">—</span>}</td>
                 <td>{l.location || <span className="muted">—</span>}</td>
                 <td className="col-status"><span className={`badge badge-${l.status}`}>{l.status}</span></td>
+                <td><SequenceProgress lead={l} seq={campaign.sequence_config || []} /></td>
                 <td>
                   <div className="small">{prettyAction(l.last_action)}</div>
                   <div className="muted small">{l.last_action_date ? new Date(l.last_action_date).toLocaleDateString() : ''}</div>
@@ -325,8 +319,10 @@ function LeadsTab({ campaign, reload }) {
               </tr>
               {expanded === l.id && (
                 <tr className="expanded-row">
-                  <td colSpan={9}>
-                    <ProfileExpanded lead={l} reload={reload} />
+                  <td colSpan={10}>
+                    <ExpandErrorBoundary key={l.id}>
+                      <ProfileExpanded lead={l} reload={reload} />
+                    </ExpandErrorBoundary>
                   </td>
                 </tr>
               )}
@@ -377,14 +373,14 @@ function ProfileExpanded({ lead: l, reload }) {
       )}
       {Array.isArray(l.keywords) && l.keywords.length > 0 && (
         <div className="profile-row">
-          {l.keywords.slice(0, 20).map((k, i) => <span key={i} className="chip muted">{k}</span>)}
+          {l.keywords.slice(0, 20).map((k, i) => <span key={i} className="chip muted">{k?.name || k}</span>)}
         </div>
       )}
       {Array.isArray(l.technologies) && l.technologies.length > 0 && (
         <details>
           <summary className="muted small">{l.technologies.length} technologies</summary>
           <div className="profile-row" style={{ marginTop: 4 }}>
-            {l.technologies.map((t, i) => <span key={i} className="chip muted">{t}</span>)}
+            {l.technologies.map((t, i) => <span key={i} className="chip muted">{t?.name || t}</span>)}
           </div>
         </details>
       )}
@@ -473,7 +469,7 @@ function Owner({ lead: l, reload }) {
     <>
       <h4>Owners ({contacts.length})</h4>
       <div className="owners-list">
-        {contacts.map((c, i) => (
+        {contacts.filter(Boolean).map((c, i) => (
           <OwnerCard
             key={i}
             contact={c}
@@ -586,19 +582,19 @@ function TeamMembers({ leadId }) {
 function Bio({ bio }) {
   return (
     <div className="bio-grid">
-      {bio.ice_breakers?.length > 0 && (
+      {Array.isArray(bio.ice_breakers) && bio.ice_breakers.length > 0 && (
         <div>
           <h4>Ice Breakers</h4>
           <ul>{bio.ice_breakers.map((x, i) => <li key={i}>{x}</li>)}</ul>
         </div>
       )}
-      {bio.industry_news?.length > 0 && (
+      {Array.isArray(bio.industry_news) && bio.industry_news.length > 0 && (
         <div>
           <h4>Industry News</h4>
           <ul>{bio.industry_news.map((x, i) => <li key={i}>{x}</li>)}</ul>
         </div>
       )}
-      {bio.talking_points?.length > 0 && (
+      {Array.isArray(bio.talking_points) && bio.talking_points.length > 0 && (
         <div>
           <h4>Talking Points</h4>
           <ul>{bio.talking_points.map((x, i) => <li key={i}>{x}</li>)}</ul>
@@ -766,12 +762,8 @@ function OwnersTab({ campaignId, sequenceConfig }) {
 }
 
 function OutreachTab({ campaign, reload }) {
-  // Mirrors sequence_config 1:1 — N call steps → N vm_scripts editors,
-  // M email steps → M template editors. Backfills vm_scripts[0] from
-  // legacy single vm_script for old campaigns.
   const seq = campaign.sequence_config || [];
   const callCount = seq.filter((s) => s?.type === 'call').length;
-  const emailCount = seq.filter((s) => s?.type === 'email').length;
 
   const initialVmScripts = (() => {
     const arr = [...(campaign.vm_scripts || [])];
@@ -780,24 +772,9 @@ function OutreachTab({ campaign, reload }) {
     return arr.slice(0, callCount);
   })();
 
-  const initialTemplates = (() => {
-    const arr = [...(campaign.email_templates || [])];
-    while (arr.length < emailCount) arr.push({ subject: '', body: '' });
-    return arr.slice(0, emailCount);
-  })();
-
-  const [templates, setTemplates] = useState(initialTemplates);
   const [vmScripts, setVmScripts] = useState(initialVmScripts);
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
-  const locked = !!campaign.locked_at;
-
-  function updateTpl(i, field, v) {
-    const next = [...templates];
-    next[i] = { ...next[i], [field]: v };
-    setTemplates(next);
-    setSaved(false);
-  }
 
   function updateVm(i, v) {
     const next = [...vmScripts];
@@ -810,9 +787,7 @@ function OutreachTab({ campaign, reload }) {
     setBusy(true);
     try {
       await api.updateCampaign(campaign.id, {
-        email_templates: templates,
         vm_scripts: vmScripts,
-        // Keep singular vm_script in sync with vm_scripts[0] for backwards-compat readers.
         vm_script: vmScripts[0] || '',
       });
       setSaved(true);
@@ -822,39 +797,20 @@ function OutreachTab({ campaign, reload }) {
     }
   }
 
-  // Walk sequence_config and group steps by type for ordered rendering.
-  // Each call step gets its own vm_scripts editor; each email gets its own template.
   let callIdx = 0;
-  let emailIdx = 0;
   const stepEditors = seq.map((step, stepNum) => {
     if (step?.type === 'call') {
       const idx = callIdx++;
-      return {
-        kind: 'call',
-        stepNum,
-        idx,
-        label: step.label || `Voicemail ${idx + 1}`,
-        waitDays: step.wait_days || 0,
-      };
-    }
-    if (step?.type === 'email') {
-      const idx = emailIdx++;
-      return {
-        kind: 'email',
-        stepNum,
-        idx,
-        label: step.label || (idx === 0 ? 'Initial email' : `Follow-up ${idx}`),
-        waitDays: step.wait_days || 0,
-      };
+      return { stepNum, idx, label: step.label || `Call ${idx + 1}`, waitDays: step.wait_days || 0 };
     }
     return null;
   }).filter(Boolean);
 
-  if (seq.length === 0) {
+  if (stepEditors.length === 0) {
     return (
       <div className="outreach">
         <div className="empty">
-          <p>No sequence steps yet. Add steps in the Sequence Builder tab — content editors for each step will appear here.</p>
+          <p>No call steps yet. Add steps in the Sequence Builder tab — voicemail editors will appear here.</p>
         </div>
       </div>
     );
@@ -862,66 +818,38 @@ function OutreachTab({ campaign, reload }) {
 
   return (
     <div className="outreach">
-      {locked && <LockBanner />}
       <div className="section-head">
-        <h2>Outreach Content</h2>
+        <h2>Voicemail Scripts</h2>
         <span className="muted small">
-          One editor per sequence step ({callCount} call{callCount === 1 ? '' : 's'}, {emailCount} email{emailCount === 1 ? '' : 's'}). Variables: [FIRST_NAME], [COMPANY], [INDUSTRY], [SENDER]
+          One script per call step ({callCount} call{callCount === 1 ? '' : 's'}). Variables: [FIRST_NAME], [COMPANY], [INDUSTRY]
         </span>
       </div>
 
       <div className="step-editors">
         {stepEditors.map((s) => (
-          <div key={s.stepNum} className={`step-editor ${s.kind} ${locked ? 'locked' : ''}`}>
+          <div key={s.stepNum} className="step-editor call">
             <div className="step-editor-head">
-              <span className="step-icon">{s.kind === 'call' ? '📞' : '✉️'}</span>
+              <span className="step-icon">📞</span>
               <span className="step-editor-title">Step {s.stepNum + 1}: {s.label}</span>
               <span className="muted small">wait {s.waitDays}d</span>
             </div>
-            {s.kind === 'call' ? (
-              <label className="field grow">
-                <span>Voicemail script</span>
-                <textarea
-                  rows={5}
-                  value={vmScripts[s.idx] || ''}
-                  onChange={(e) => updateVm(s.idx, e.target.value)}
-                  placeholder="Hi [FIRST_NAME], I'm calling because…"
-                  disabled={locked}
-                />
-              </label>
-            ) : (
-              <>
-                <label className="field">
-                  <span>Subject</span>
-                  <input
-                    value={templates[s.idx]?.subject || ''}
-                    onChange={(e) => updateTpl(s.idx, 'subject', e.target.value)}
-                    placeholder="Subject"
-                    disabled={locked}
-                  />
-                </label>
-                <label className="field grow">
-                  <span>Body</span>
-                  <textarea
-                    rows={8}
-                    value={templates[s.idx]?.body || ''}
-                    onChange={(e) => updateTpl(s.idx, 'body', e.target.value)}
-                    placeholder="Body"
-                    disabled={locked}
-                  />
-                </label>
-              </>
-            )}
+            <label className="field grow">
+              <span>Voicemail script</span>
+              <textarea
+                rows={5}
+                value={vmScripts[s.idx] || ''}
+                onChange={(e) => updateVm(s.idx, e.target.value)}
+                placeholder="Hi [FIRST_NAME], I'm calling because…"
+              />
+            </label>
           </div>
         ))}
       </div>
 
-      {!locked && (
-        <div className="row save-row">
-          <button className="primary" disabled={busy} onClick={save}>{busy ? 'Saving…' : 'Save changes'}</button>
-          {saved && <span className="muted small">Saved</span>}
-        </div>
-      )}
+      <div className="row save-row">
+        <button className="primary" disabled={busy} onClick={save}>{busy ? 'Saving…' : 'Save changes'}</button>
+        {saved && <span className="muted small">Saved</span>}
+      </div>
     </div>
   );
 }
@@ -930,10 +858,8 @@ function SequenceTab({ campaign, reload }) {
   const [steps, setSteps] = useState(campaign.sequence_config || []);
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
-  const locked = !!campaign.locked_at;
 
   function update(i, field, v) {
-    if (locked) return;
     const next = [...steps];
     next[i] = { ...next[i], [field]: v };
     setSteps(next);
@@ -941,11 +867,10 @@ function SequenceTab({ campaign, reload }) {
   }
 
   function addStep() {
-    if (locked) return;
-    setSteps([...steps, { type: 'email', wait_days: 3, active: true, label: 'New step' }]);
+    setSteps([...steps, { type: 'call', wait_days: 3, active: true, label: 'Call' }]);
     setSaved(false);
   }
-  function removeStep(i) { if (locked) return; setSteps(steps.filter((_, idx) => idx !== i)); setSaved(false); }
+  function removeStep(i) { setSteps(steps.filter((_, idx) => idx !== i)); setSaved(false); }
 
   async function save() {
     setBusy(true);
@@ -958,57 +883,48 @@ function SequenceTab({ campaign, reload }) {
     }
   }
 
-  // Cumulative day from campaign start (sum of wait_days up to and including step i)
   let cumulative = 0;
 
   return (
     <div className="sequence">
-      {locked && <LockBanner />}
       <div className="section-head">
-        <h2>Outreach Sequence</h2>
+        <h2>Call Sequence</h2>
         <span className="muted small">Steps run in order; "Wait" is days since the previous step</span>
       </div>
       <div className="step-list">
         {steps.map((s, i) => {
           cumulative += (s.wait_days || 0);
           const dayLabel = `Day ${cumulative}`;
-          const isCall = s.type === 'call';
           return (
-            <div key={i} className={`step-card ${s.active ? '' : 'inactive'} ${isCall ? 'step-call' : 'step-email'} ${locked ? 'locked' : ''}`}>
+            <div key={i} className={`step-card ${s.active ? '' : 'inactive'} step-call`}>
               <div className="step-num">{i + 1}</div>
               <div className="step-day">{dayLabel}</div>
               <div className="step-type-pill">
-                <span className="step-icon">{isCall ? '📞' : '✉️'}</span>
-                <span>{isCall ? 'Call + VM' : 'Email'}</span>
+                <span className="step-icon">📞</span>
+                <span>Call + VM</span>
               </div>
-              <select value={s.type} onChange={(e) => update(i, 'type', e.target.value)} className="step-select" disabled={locked}>
-                <option value="email">Email</option>
-                <option value="call">Call + VM</option>
-              </select>
               <label className="step-wait">
                 <span>Wait</span>
                 <input type="number" min={0} value={s.wait_days || 0}
-                  onChange={(e) => update(i, 'wait_days', parseInt(e.target.value, 10) || 0)} disabled={locked} />
+                  onChange={(e) => update(i, 'wait_days', parseInt(e.target.value, 10) || 0)} />
                 <span>days</span>
               </label>
               <input className="step-label" value={s.label || ''}
-                onChange={(e) => update(i, 'label', e.target.value)} placeholder="Label" disabled={locked} />
+                onChange={(e) => update(i, 'label', e.target.value)} placeholder="Label" />
               <label className="toggle">
-                <input type="checkbox" checked={!!s.active} onChange={(e) => update(i, 'active', e.target.checked)} disabled={locked} />
+                <input type="checkbox" checked={!!s.active} onChange={(e) => update(i, 'active', e.target.checked)} />
                 <span>{s.active ? 'On' : 'Off'}</span>
               </label>
-              {!locked && <button className="ghost danger small" title="Remove" onClick={() => removeStep(i)}>×</button>}
+              <button className="ghost danger small" title="Remove" onClick={() => removeStep(i)}>×</button>
             </div>
           );
         })}
       </div>
-      {!locked && (
-        <div className="row save-row">
-          <button className="ghost" onClick={addStep}>+ Add step</button>
-          <button className="primary" disabled={busy} onClick={save}>{busy ? 'Saving…' : 'Save sequence'}</button>
-          {saved && <span className="muted small">Saved</span>}
-        </div>
-      )}
+      <div className="row save-row">
+        <button className="ghost" onClick={addStep}>+ Add call step</button>
+        <button className="primary" disabled={busy} onClick={save}>{busy ? 'Saving…' : 'Save sequence'}</button>
+        {saved && <span className="muted small">Saved</span>}
+      </div>
     </div>
   );
 }
@@ -1019,4 +935,34 @@ function hostname(url) {
 function prettyAction(a) {
   if (!a) return '—';
   return a.replace(/_/g, ' ');
+}
+
+function SequenceProgress({ lead, seq }) {
+  const step = lead.sequence_step || 0;
+  const total = seq.length;
+  if (total === 0) return null;
+  if (step >= total) {
+    return <span className="badge badge-complete">Complete</span>;
+  }
+  const currentStep = seq[step];
+  if (!currentStep) return null;
+  const waitDays = currentStep.wait_days || 0;
+  if (waitDays > 0 && lead.last_called_at) {
+    const daysSince = (Date.now() - new Date(lead.last_called_at)) / 86_400_000;
+    const daysLeft = Math.ceil(waitDays - daysSince);
+    if (daysLeft > 0) {
+      return (
+        <div>
+          <span className="badge badge-called">Step {step + 1}/{total}</span>
+          <div className="muted small" style={{ whiteSpace: 'nowrap' }}>Ready in {daysLeft}d</div>
+        </div>
+      );
+    }
+  }
+  return (
+    <div>
+      <span className="badge badge-new">Step {step + 1}/{total}</span>
+      <div className="muted small">Ready</div>
+    </div>
+  );
 }
