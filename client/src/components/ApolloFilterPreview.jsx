@@ -32,6 +32,7 @@ export default function ApolloFilterPreview({ prompt, filters, onChange }) {
   const [loading, setLoading] = useState(!filters);
   const [previewBusy, setPreviewBusy] = useState(false);
   const [preview, setPreview] = useState([]);
+  const [totalSampled, setTotalSampled] = useState(null);
   const [err, setErr] = useState(null);
 
   useEffect(() => {
@@ -47,8 +48,9 @@ export default function ApolloFilterPreview({ prompt, filters, onChange }) {
     if (!filters) return;
     setPreviewBusy(true); setErr(null);
     try {
-      const { sample } = await api.previewApolloSearch(filters, 25);
+      const { sample, total_sampled } = await api.previewApolloSearch(filters, 25);
       setPreview(sample);
+      setTotalSampled(total_sampled);
     } catch (e) { setErr(e.message); }
     finally { setPreviewBusy(false); }
   }
@@ -109,7 +111,7 @@ export default function ApolloFilterPreview({ prompt, filters, onChange }) {
 
       {preview.length > 0 && (
         <div className="preview-list">
-          <div className="muted">Showing {preview.length} sample companies:</div>
+          <div className="muted">Showing {preview.length} of {totalSampled ?? preview.length} companies Apollo returned (page 1 only — full run fetches up to 5 pages):</div>
           <ul>
             {preview.map((p, i) => (
               <li key={i}>
