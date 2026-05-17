@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import path from 'node:path';
+import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { synthesizeMyName } from './services/elevenlabs.js';
 import { campaignsRouter } from './routes/campaigns.js';
@@ -62,6 +63,24 @@ app.use('/api/sources', sourcesRouter);
 app.use('/api/signalhire', signalhireRouter);
 
 app.get('/audio/:file', audioStaticHandler);
+
+// Admin: clear synthesized voicemail + announce mp3s so they are re-generated
+// with the current ElevenLabs settings on next dial session.
+app.delete('/api/admin/audio-cache', (req, res) => {
+  const dir = path.resolve('audio_cache');
+  let deleted = 0;
+  try {
+    for (const f of fs.readdirSync(dir)) {
+      // Skip my_name.mp3 — it's a manually uploaded file, not synthesized.
+      if (f === 'my_name.mp3') continue;
+      fs.unlinkSync(path.join(dir, f));
+      deleted++;
+    }
+    res.json({ ok: true, deleted });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // Serve the built React app
 const clientDist = path.resolve(__dirname, '..', 'client', 'dist');
