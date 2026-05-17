@@ -27,6 +27,7 @@ export default function DialSession() {
   const [paused, setPaused] = useState(false);
   const [sayingName, setSayingName] = useState(false);
   const [muted, setMuted] = useState(false);
+  const [droppingVm, setDroppingVm] = useState(false);
 
   const deviceRef        = useRef(null);
   const callRef          = useRef(null);
@@ -36,6 +37,7 @@ export default function DialSession() {
   const noAnswerTimerRef = useRef(null);
   const vmTimeoutRef     = useRef(null);
   const callSidRef       = useRef(null);
+  const childCallSidRef  = useRef(null);
 
   // Refs that async callbacks read — avoids stale closure bugs
   const callPhaseRef = useRef('idle');
@@ -129,6 +131,8 @@ export default function DialSession() {
     stopAll();
     setSayingName(false);
     setMuted(false);
+    setDroppingVm(false);
+    childCallSidRef.current = null;
 
     if (pausedRef.current) { setCallPhaseSync('idle'); return; }
     if (!remaining?.length) { setPhase('ended'); setCurrent(null); return; }
@@ -206,10 +210,16 @@ export default function DialSession() {
   }
 
   function handleAmdEvent(ev) {
+    // Capture child call SID as early as possible (status callback pushes it on
+    // initiated/ringing; AMD callback carries it on human/machine).
+    if (ev.callSid && (ev.type === 'child_sid' || ev.type === 'human' || ev.type === 'machine')) {
+      childCallSidRef.current = ev.callSid;
+    }
+
     // Ignore AMD detection events once we're already live — prevents late or
     // duplicate SSE events from interfering with an active conversation.
     const cp = callPhaseRef.current;
-    if (ev.type !== 'status' && (cp === 'live' || cp === 'outcome')) return;
+    if (ev.type !== 'status' && ev.type !== 'child_sid' && (cp === 'live' || cp === 'outcome')) return;
 
     if (ev.type === 'human') {
       clearTimeout(noAnswerTimerRef.current);
@@ -279,26 +289,34 @@ export default function DialSession() {
     }
   }
 
-  // Drop voicemail in the background and immediately advance to the next lead.
-  // The server redirects the dialed child leg to /voicemail TwiML; we disconnect
-  // the browser leg and move on without waiting for the VM to finish playing.
-  function leaveVoicemail() {
+  // Drop voicemail and immediately advance to the next lead.
+  // Must AWAIT the server redirect before disconnecting — otherwise Twilio
+  // hangs up the child call when the parent disconnects and no VM plays.
+  async function leaveVoicemail() {
+    if (droppingVm) return;
     const sid = callSidRef.current;
+    const childSid = childCallSidRef.current;
     const rem = callRef._remaining;
     const leadId = rem?.[0]?.id;
 
-    if (sid) {
-      fetch('/api/twilio/trigger-voicemail', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ callSid: sid, leadId }),
-      }).catch((e) => console.warn('[leaveVoicemail] trigger failed', e.message));
-    }
-
+    setDroppingVm(true);
     clearTimeout(noAnswerTimerRef.current);
     clearInterval(liveTimerRef.current);
-    // Prevent the disconnect handler from double-advancing.
+    // Lock advancing before the await so any stray disconnect event during the
+    // network call doesn't double-advance.
     advancingRef.current = true;
+
+    try {
+      await fetch('/api/twilio/trigger-voicemail', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ callSid: sid, childCallSid: childSid, leadId }),
+      });
+    } catch (e) {
+      console.warn('[leaveVoicemail] trigger failed', e.message);
+    }
+
+    // Redirect is confirmed — now safe to drop the browser leg.
     try { callRef.current?.disconnect(); } catch {}
     advance(rem);
   }
@@ -427,7 +445,9 @@ export default function DialSession() {
             </button>
           )}
           {['ringing', 'live'].includes(callPhase) && (
-            <button onClick={leaveVoicemail} disabled={!callSid}>Drop Voicemail &amp; Next</button>
+            <button onClick={leaveVoicemail} disabled={droppingVm}>
+              {droppingVm ? 'Dropping…' : 'Drop Voicemail & Next'}
+            </button>
           )}
           {['dialing', 'ringing', 'live'].includes(callPhase) && (
             <>

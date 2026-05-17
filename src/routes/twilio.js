@@ -168,6 +168,12 @@ twilioRouter.post('/status', async (req, res) => {
   const callSid = req.body.CallSid;
   const parentCallSid = req.body.ParentCallSid;
 
+  // Push child SID to the UI as soon as the dialed leg is initiated so the
+  // manual voicemail button can use it directly (avoids a slow REST lookup).
+  if ((status === 'initiated' || status === 'ringing') && sessionId && callSid && parentCallSid) {
+    publish(sessionId, { type: 'child_sid', callSid, parentCallSid });
+  }
+
   if (status === 'completed' && leadId) {
     let outcome = 'completed';
     if (answeredBy && answeredBy.startsWith('machine')) outcome = 'voicemail';
@@ -248,27 +254,32 @@ twilioRouter.post('/status', async (req, res) => {
   res.sendStatus(200);
 });
 
-// Trigger voicemail on demand — called by the browser dialer when the agent
-// manually wants to leave a voicemail. The browser SDK exposes the PARENT call
-// SID; we look up the active child leg (the dialed number) and redirect it to
-// the /voicemail TwiML, same as the AMD machine path. The browser leg
-// disconnects independently so the next call can start immediately.
+// Trigger voicemail on demand — redirects the dialed child leg to /voicemail
+// TwiML so it plays the ElevenLabs recording while the browser advances.
+// Prefer childCallSid (sent by the UI after capturing it from the status SSE).
+// Falls back to a parent-SID REST lookup if the child SID isn't available yet.
+// IMPORTANT: the caller must await this response before disconnecting the
+// browser leg — otherwise Twilio hangs up the child before the redirect lands.
 twilioRouter.post('/trigger-voicemail', async (req, res) => {
-  const { callSid, leadId } = req.body || {};
-  if (!callSid) return res.status(400).json({ error: 'callSid required' });
+  const { callSid, childCallSid, leadId } = req.body || {};
+  if (!callSid && !childCallSid) return res.status(400).json({ error: 'callSid required' });
   const base = publicBaseUrl();
   try {
-    // callSid from the browser SDK is the parent leg — find the dialed child leg.
-    const children = await client().calls.list({ parentCallSid: callSid, limit: 5 });
-    const child = children.find(
-      (c) => c.status !== 'completed' && c.status !== 'canceled' && c.status !== 'failed',
-    );
-    if (!child) return res.status(404).json({ error: 'No active child call found' });
-    await client().calls(child.sid).update({
+    let targetSid = childCallSid || null;
+    if (!targetSid) {
+      // Fall back: look up the active child leg by parent SID.
+      const children = await client().calls.list({ parentCallSid: callSid, limit: 5 });
+      const child = children.find(
+        (c) => c.status !== 'completed' && c.status !== 'canceled' && c.status !== 'failed',
+      );
+      if (!child) return res.status(404).json({ error: 'No active child call found' });
+      targetSid = child.sid;
+    }
+    await client().calls(targetSid).update({
       url: `${base}/api/twilio/voicemail?leadId=${encodeURIComponent(leadId || '')}`,
       method: 'POST',
     });
-    res.json({ ok: true, childSid: child.sid });
+    res.json({ ok: true, childSid: targetSid });
   } catch (e) {
     console.warn('[twilio/trigger-voicemail] failed', e.message);
     res.status(500).json({ error: e.message });
