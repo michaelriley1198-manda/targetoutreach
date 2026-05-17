@@ -42,7 +42,7 @@ async function synthesizeMp3(targetPath, text) {
     {
       text,
       model_id: 'eleven_turbo_v2_5',
-      voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+      voice_settings: { stability: 0.3, similarity_boost: 0.75, style: 0.3, use_speaker_boost: true },
     },
     {
       headers: {
