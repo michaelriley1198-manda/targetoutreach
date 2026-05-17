@@ -11,6 +11,7 @@
 import axios from 'axios';
 import Anthropic from '@anthropic-ai/sdk';
 import { exaSearch } from './exa.js';
+import { findEmail as lmFindEmail, findMobile as lmFindMobile } from './leadmagic.js';
 
 const APOLLO_BASE = 'https://api.apollo.io/api/v1';
 const TIMEOUT = 30_000;
@@ -257,39 +258,45 @@ export async function enrichByName({ name, firstName, lastName, domain }) {
   const l = lastName  || splitName(name).last;
   if (!f || !domain) return null;
 
-  const body = {
-    first_name: f,
-    domain,
-    reveal_personal_emails: true,
-  };
+  // Apollo: ID + metadata only — no reveal flags, no credit-burning waterfall.
+  const body = { first_name: f, domain };
   if (l) body.last_name = l;
-  // Note: we deliberately omit run_waterfall_email/phone here — those are only
-  // useful when Apollo doesn't have the person cached. The findOwner flow in
-  // pipeline/run.js already triggers waterfall for the top-of-list contact.
-  // Per-additional-contact waterfall would multiply credit cost; users can
-  // re-trigger waterfall manually via scripts/trigger-waterfall.js if needed.
 
+  let apolloContactId = null, linkedinUrl = null, titleApollo = null, apolloEmail = null;
   try {
     const { data } = await axios.post(`${APOLLO_BASE}/people/match`, body, {
       headers: { 'X-Api-Key': process.env.APOLLO_API_KEY, 'Content-Type': 'application/json' },
       timeout: TIMEOUT,
     });
     const p = data?.person;
-    if (!p) return null;
-    return {
-      apollo_contact_id: p.id || null,
-      email: p.email || p.personal_emails?.[0] || null,
-      phone:
-        p.sanitized_phone ||
-        p.phone_numbers?.[0]?.sanitized_number ||
-        p.phone_numbers?.[0]?.raw_number ||
-        null,
-      linkedin_url: p.linkedin_url || null,
-      title_apollo: p.title || null,
-    };
-  } catch (e) {
-    return null;
+    if (p) {
+      apolloContactId = p.id || null;
+      linkedinUrl = p.linkedin_url || null;
+      titleApollo = p.title || null;
+      apolloEmail = p.email || p.personal_emails?.[0] || null;
+    }
+  } catch (_) {
+    // best-effort
   }
+
+  // Email: Apollo cached data first (free), LeadMagic as fallback.
+  const emailResult = apolloEmail ? { email: apolloEmail } : await lmFindEmail({ firstName: f, lastName: l, companyDomain: domain });
+  const resolvedEmail = emailResult?.email || null;
+
+  // Phone: LeadMagic only (requires email or LinkedIn URL to query).
+  const phoneResult = await lmFindMobile({
+    firstName: f, lastName: l, companyDomain: domain,
+    linkedinUrl: linkedinUrl || null,
+    workEmail: resolvedEmail || null,
+  });
+
+  return {
+    apollo_contact_id: apolloContactId,
+    email: resolvedEmail,
+    phone: phoneResult?.phone || null,
+    linkedin_url: linkedinUrl,
+    title_apollo: titleApollo,
+  };
 }
 
 // ----------------------------------------------------------------------------

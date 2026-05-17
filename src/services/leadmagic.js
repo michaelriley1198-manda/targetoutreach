@@ -35,12 +35,18 @@ export async function findEmail({ firstName, lastName, companyDomain }) {
   }
 }
 
-export async function findMobile({ firstName, lastName, companyDomain }) {
+// mobile-finder requires at least one of: profile_url, work_email, personal_email.
+export async function findMobile({ firstName, lastName, companyDomain, linkedinUrl, workEmail, personalEmail }) {
   if (!firstName || !lastName || !companyDomain) return null;
+  if (!linkedinUrl && !workEmail && !personalEmail) return null;
+  const body = { first_name: firstName, last_name: lastName, company_domain: companyDomain };
+  if (linkedinUrl) body.profile_url = linkedinUrl;
+  if (workEmail) body.work_email = workEmail;
+  if (personalEmail) body.personal_email = personalEmail;
   try {
     const { data } = await axios.post(
       `${BASE}/mobile-finder`,
-      { first_name: firstName, last_name: lastName, company_domain: companyDomain },
+      body,
       { headers: headers(), timeout: TIMEOUT }
     );
     return {
@@ -106,7 +112,7 @@ function domainFromUrl(url) {
 // Apollo's people-match + waterfall reveal has settled. Returns a partial
 // update dict for the `lead_owners` row, or null when nothing was found.
 // Never overwrites an existing value.
-export async function fallbackContact(owner, { companyDomain } = {}) {
+export async function fallbackContact(owner, { companyDomain, prefilledEmail } = {}) {
   if (!process.env.LEADMAGIC_API_KEY) return null;
   if (!owner) return null;
 
@@ -121,12 +127,19 @@ export async function fallbackContact(owner, { companyDomain } = {}) {
   const domain = companyDomain || domainFromUrl(owner.company_url || owner.linkedin_url);
   if (!firstName || !lastName || !domain) return null;
 
-  const needEmail = !owner.email;
+  const needEmail = !owner.email && !prefilledEmail;
   const needPhone = !owner.phone;
   if (!needEmail && !needPhone) return null;
 
   const update = {};
   let filled = false;
+
+  // Apply pre-filled email (e.g. from Apollo cache) without calling LeadMagic.
+  if (prefilledEmail && !owner.email) {
+    update.email = prefilledEmail;
+    update.email_status = 'apollo_cached';
+    filled = true;
+  }
 
   if (needEmail) {
     const r = await findEmail({ firstName, lastName, companyDomain: domain });
@@ -137,7 +150,12 @@ export async function fallbackContact(owner, { companyDomain } = {}) {
     }
   }
   if (needPhone) {
-    const r = await findMobile({ firstName, lastName, companyDomain: domain });
+    const knownEmail = update.email || owner.email;
+    const r = await findMobile({
+      firstName, lastName, companyDomain: domain,
+      linkedinUrl: owner.linkedin_url || null,
+      workEmail: knownEmail || null,
+    });
     if (r?.phone) {
       update.phone = r.phone;
       update.phone_status = r.status || 'unknown';

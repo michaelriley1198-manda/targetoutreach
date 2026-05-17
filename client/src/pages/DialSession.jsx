@@ -4,19 +4,19 @@ import { Device } from '@twilio/voice-sdk';
 import { api } from '../api.js';
 import LogOutcomeModal from '../components/LogOutcomeModal.jsx';
 
-// State machine:
-//   booting → device_ready → idle
-//   per lead: announcing → dialing → ringing → (live | vm | noanswer)
-//   live → outcome_modal → idle
-// "Pause" stops new dials after current call resolves.
-const NO_ANSWER_MS = 30_000;
+// Phases:
+//   booting → device_ready → running | paused | ended
+// Per-call: announcing → dialing → ringing → live | vm | noanswer
+//   live → outcome → (next announcing)
+const NO_ANSWER_MS = 55_000;
+const VM_TIMEOUT_MS = 60_000;
 
 export default function DialSession() {
   const { id } = useParams();
   const nav = useNavigate();
 
-  const [phase, setPhase] = useState('booting'); // booting | device_ready | running | paused | ended
-  const [callPhase, setCallPhase] = useState('idle'); // idle | announcing | dialing | ringing | live | vm | noanswer | outcome
+  const [phase, setPhase] = useState('booting');
+  const [callPhase, setCallPhase] = useState('idle');
   const [queue, setQueue] = useState([]);
   const [current, setCurrent] = useState(null);
   const [sessionId, setSessionId] = useState(null);
@@ -25,27 +25,43 @@ export default function DialSession() {
   const [err, setErr] = useState(null);
   const [micOk, setMicOk] = useState(null);
   const [paused, setPaused] = useState(false);
+  const [sayingName, setSayingName] = useState(false);
+  const [muted, setMuted] = useState(false);
 
-  const deviceRef = useRef(null);
-  const callRef = useRef(null);
-  const sseRef = useRef(null);
-  const announceRef = useRef(null);
-  const holdMusicRef = useRef(null);
-  const liveAudioElRef = useRef(null);
-  const liveTimerRef = useRef(null);
+  const deviceRef        = useRef(null);
+  const callRef          = useRef(null);
+  const sseRef           = useRef(null);
+  const announceRef      = useRef(null);
+  const liveTimerRef     = useRef(null);
   const noAnswerTimerRef = useRef(null);
+  const vmTimeoutRef     = useRef(null);
+  const callSidRef       = useRef(null);
 
-  // ----- boot: fetch token, init Twilio Device, request mic -----
+  // Refs that async callbacks read — avoids stale closure bugs
+  const callPhaseRef = useRef('idle');
+  const pausedRef    = useRef(false);
+  const sessionIdRef = useRef(null);
+  // Guards against double-advance
+  const advancingRef = useRef(false);
+
+  useEffect(() => { callPhaseRef.current = callPhase; }, [callPhase]);
+  useEffect(() => { pausedRef.current = paused; }, [paused]);
+  useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
+  useEffect(() => { callSidRef.current = callSid; }, [callSid]);
+
+  function setCallPhaseSync(p) {
+    callPhaseRef.current = p;
+    setCallPhase(p);
+  }
+
+  // ----- boot -----
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
         const { token } = await api.getTwilioToken();
         if (cancelled) return;
-        const device = new Device(token, {
-          logLevel: 'warn',
-          codecPreferences: ['opus', 'pcmu'],
-        });
+        const device = new Device(token, { logLevel: 'warn', codecPreferences: ['opus', 'pcmu'] });
         device.on('registered', () => !cancelled && setPhase('device_ready'));
         device.on('error', (e) => setErr(`Device: ${e.message || e}`));
         await device.register();
@@ -58,7 +74,7 @@ export default function DialSession() {
       cancelled = true;
       try { deviceRef.current?.destroy(); } catch {}
       try { sseRef.current?.close(); } catch {}
-      stopAudio();
+      stopAll();
     };
   }, []);
 
@@ -77,6 +93,7 @@ export default function DialSession() {
     setErr(null);
     setPhase('running');
     setPaused(false);
+    pausedRef.current = false;
     try {
       const { session_id, leads } = await api.dial(id, null);
       if (!session_id || !leads?.length) {
@@ -85,14 +102,12 @@ export default function DialSession() {
         return;
       }
       setSessionId(session_id);
+      sessionIdRef.current = session_id;
       setQueue(leads);
-      // Open SSE stream for AMD events
+
       const es = api.dialSessionEvents(session_id);
       es.onmessage = (msg) => {
-        try {
-          const ev = JSON.parse(msg.data);
-          handleAmdEvent(ev);
-        } catch {}
+        try { handleAmdEvent(JSON.parse(msg.data)); } catch {}
       };
       sseRef.current = es;
       dialNext(leads);
@@ -102,151 +117,249 @@ export default function DialSession() {
     }
   }
 
-  function stopAudio() {
-    try { announceRef.current?.pause(); } catch {}
-    try { if (holdMusicRef.current) { holdMusicRef.current.pause(); holdMusicRef.current.currentTime = 0; } } catch {}
+  function stopAll() {
+    try { announceRef.current?.pause(); announceRef.current = null; } catch {}
     clearInterval(liveTimerRef.current);
     clearTimeout(noAnswerTimerRef.current);
+    clearTimeout(vmTimeoutRef.current);
   }
 
   async function dialNext(remaining) {
-    const q = remaining || queue;
-    if (paused) { setCallPhase('idle'); return; }
-    if (!q.length) {
-      setPhase('ended');
-      setCurrent(null);
-      return;
-    }
-    const lead = q[0];
+    advancingRef.current = false;
+    stopAll();
+    setSayingName(false);
+    setMuted(false);
+
+    if (pausedRef.current) { setCallPhaseSync('idle'); return; }
+    if (!remaining?.length) { setPhase('ended'); setCurrent(null); return; }
+
+    const lead = remaining[0];
     setCurrent(lead);
     setCallSid(null);
+    callSidRef.current = null;
     setTalkSeconds(0);
 
-    // 1) Play announcement
-    setCallPhase('announcing');
-    try {
-      announceRef.current = new Audio(`/audio/announce_${lead.id}.mp3`);
-      await new Promise((resolve) => {
-        announceRef.current.onended = resolve;
-        announceRef.current.onerror = resolve;
-        announceRef.current.play().catch(resolve);
-      });
-    } catch {}
+    // 1) Announce who we're calling
+    setCallPhaseSync('announcing');
+    await new Promise((resolve) => {
+      try {
+        const a = new Audio(`/audio/announce_${lead.id}.mp3`);
+        announceRef.current = a;
+        a.onended = resolve;
+        a.onerror = resolve;
+        a.play().catch(resolve);
+      } catch { resolve(); }
+    });
+    announceRef.current = null;
 
-    // 2) Start hold music looping (will be stopped on AMD event)
-    try {
-      holdMusicRef.current = new Audio('https://demo.twilio.com/docs/classic.mp3');
-      holdMusicRef.current.loop = true;
-      holdMusicRef.current.volume = 0.5;
-      holdMusicRef.current.play().catch(() => {});
-    } catch {}
+    if (pausedRef.current) { setCallPhaseSync('idle'); return; }
 
-    // 3) Place the outbound call via Device.connect; Twilio fetches TwiML
-    // from our /api/twilio/connect endpoint with these params.
-    setCallPhase('dialing');
+    // 2) Dial
+    setCallPhaseSync('dialing');
     try {
       const call = await deviceRef.current.connect({
-        params: { leadId: lead.id, toNumber: lead.phone, sessionId },
+        params: { leadId: lead.id, toNumber: lead.phone, sessionId: sessionIdRef.current },
       });
       callRef.current = call;
-      // Mute the bridge audio until AMD confirms HUMAN — the user only hears
-      // hold music until AMD classifies.
-      try { call.mute(true); } catch {}
-      call.on('accept', () => setCallPhase('ringing'));
-      call.on('ringing', () => setCallPhase('ringing'));
-      // The dialed call's SID arrives on the parameters event in some versions;
-      // we read it from the call object itself.
+
+      call.on('accept',  () => setCallPhaseSync('ringing'));
+      call.on('ringing', () => setCallPhaseSync('ringing'));
+
       const sid = call.parameters?.CallSid || call.outboundConnectionId || null;
-      if (sid) setCallSid(sid);
+      if (sid) { setCallSid(sid); callSidRef.current = sid; }
+
       call.on('disconnect', () => {
-        // Server-side leg ended; either we got LIVE and user hung up, or
-        // server redirected to /voicemail and our parent leg's Dial action
-        // hung up the browser. Either way: if we were LIVE, show outcome modal.
         clearInterval(liveTimerRef.current);
         clearTimeout(noAnswerTimerRef.current);
-        try { holdMusicRef.current?.pause(); } catch {}
-        if (callPhaseRef.current === 'live') {
-          setCallPhase('outcome');
+
+        // Skip already called advance() — don't double-advance or show outcome modal
+        if (advancingRef.current) return;
+
+        const cp = callPhaseRef.current;
+        if (cp === 'live') {
+          setCallPhaseSync('outcome');
+        } else if (cp === 'vm') {
+          // Server-side leg still playing voicemail — wait for status SSE
         } else {
-          // Advance silently (no outcome modal for VM / no-answer)
-          advance();
+          advance(remaining);
         }
       });
-      call.on('error', (e) => { setErr(`Call: ${e.message || e}`); advance(); });
+
+      call.on('error', (e) => {
+        setErr(`Call: ${e.message || e}`);
+        advance(remaining);
+      });
 
       // 30s no-answer timer
       noAnswerTimerRef.current = setTimeout(() => {
         if (callPhaseRef.current === 'dialing' || callPhaseRef.current === 'ringing') {
-          setCallPhase('noanswer');
+          setCallPhaseSync('noanswer');
           try { call.disconnect(); } catch {}
         }
       }, NO_ANSWER_MS);
+
+      callRef._remaining = remaining;
     } catch (e) {
       setErr(`Dial failed: ${e.message}`);
-      advance();
+      advance(remaining);
     }
   }
-
-  // Mirror callPhase in a ref so async handlers can branch on the freshest value
-  const callPhaseRef = useRef(callPhase);
-  useEffect(() => { callPhaseRef.current = callPhase; }, [callPhase]);
 
   function handleAmdEvent(ev) {
+    // Ignore AMD detection events once we're already live — prevents late or
+    // duplicate SSE events from interfering with an active conversation.
+    const cp = callPhaseRef.current;
+    if (ev.type !== 'status' && (cp === 'live' || cp === 'outcome')) return;
+
     if (ev.type === 'human') {
-      try { holdMusicRef.current?.pause(); } catch {}
+      clearTimeout(noAnswerTimerRef.current);
       try { callRef.current?.mute(false); } catch {}
-      setCallPhase('live');
+      setMuted(false);
+      setCallPhaseSync('live');
       let t = 0;
       liveTimerRef.current = setInterval(() => { t += 1; setTalkSeconds(t); }, 1000);
+
     } else if (ev.type === 'machine') {
-      try { holdMusicRef.current?.pause(); } catch {}
-      setCallPhase('vm');
-      // Disconnect the browser side; server-side call keeps playing VM.
-      try { callRef.current?.disconnect(); } catch {}
-      setTimeout(advance, 800);
+      setCallPhaseSync('vm');
+      const rem = callRef._remaining;
+      vmTimeoutRef.current = setTimeout(() => {
+        if (callPhaseRef.current === 'vm') advance(rem);
+      }, VM_TIMEOUT_MS);
+
     } else if (ev.type === 'unknown') {
-      try { holdMusicRef.current?.pause(); } catch {}
-      try { callRef.current?.disconnect(); } catch {}
-      advance();
+      // AMD couldn't classify — leave call up; 55s no-answer timer handles cleanup
+
+    } else if (ev.type === 'status') {
+      if (callPhaseRef.current === 'vm') {
+        clearTimeout(vmTimeoutRef.current);
+        setTimeout(() => advance(callRef._remaining), 400);
+      }
     }
   }
 
-  function advance() {
-    setCallPhase('idle');
-    setQueue((q) => {
-      const rest = q.slice(1);
-      // Dial next in the next tick so React state has settled
-      setTimeout(() => dialNext(rest), 200);
-      return rest;
-    });
+  // Inject pre-recorded "Michael Riley" clip through the active WebRTC call.
+  // Uses RTCPeerConnection.getSenders() to temporarily replace the mic track.
+  async function sayMyName() {
+    if (sayingName) return;
+    setSayingName(true);
+    try {
+      const resp = await fetch('/audio/my_name.mp3');
+      const buf = await resp.arrayBuffer();
+      const audioCtx = new AudioContext();
+      const audioBuffer = await audioCtx.decodeAudioData(buf);
+
+      // Find the audio sender on the underlying RTCPeerConnection
+      const pc = callRef.current?._peerConnection;
+      const sender = pc?.getSenders?.().find((s) => s.track?.kind === 'audio');
+
+      if (sender) {
+        const originalTrack = sender.track;
+        const dest = audioCtx.createMediaStreamDestination();
+        const src = audioCtx.createBufferSource();
+        src.buffer = audioBuffer;
+        src.connect(dest);
+        await sender.replaceTrack(dest.stream.getAudioTracks()[0]);
+        src.start();
+        src.onended = async () => {
+          try { await sender.replaceTrack(originalTrack); } catch {}
+          audioCtx.close();
+          setSayingName(false);
+        };
+      } else {
+        // Fallback: play locally so agent can state name manually
+        console.warn('[sayMyName] RTCPeerConnection sender not accessible — playing locally only');
+        const audio = new Audio('/audio/my_name.mp3');
+        audio.onended = () => setSayingName(false);
+        audio.onerror = () => setSayingName(false);
+        audio.play().catch(() => setSayingName(false));
+      }
+    } catch (e) {
+      console.warn('[sayMyName] failed', e.message);
+      setSayingName(false);
+    }
+  }
+
+  // Drop voicemail in the background and immediately advance to the next lead.
+  // The server redirects the dialed child leg to /voicemail TwiML; we disconnect
+  // the browser leg and move on without waiting for the VM to finish playing.
+  function leaveVoicemail() {
+    const sid = callSidRef.current;
+    const rem = callRef._remaining;
+    const leadId = rem?.[0]?.id;
+
+    if (sid) {
+      fetch('/api/twilio/trigger-voicemail', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ callSid: sid, leadId }),
+      }).catch((e) => console.warn('[leaveVoicemail] trigger failed', e.message));
+    }
+
+    clearTimeout(noAnswerTimerRef.current);
+    clearInterval(liveTimerRef.current);
+    // Prevent the disconnect handler from double-advancing.
+    advancingRef.current = true;
+    try { callRef.current?.disconnect(); } catch {}
+    advance(rem);
+  }
+
+  // Hang up the active call cleanly. The disconnect handler takes over:
+  // shows the outcome modal if live, advances otherwise.
+  function hangUp() {
+    try { callRef.current?.disconnect(); } catch {}
+  }
+
+  function advance(remaining) {
+    if (advancingRef.current) return;
+    advancingRef.current = true;
+    setCallPhaseSync('idle');
+    const rem = remaining || callRef._remaining;
+    const rest = Array.isArray(rem) ? rem.slice(1) : [];
+    setQueue(rest);
+    if (pausedRef.current) return;
+    setTimeout(() => dialNext(rest), 300);
   }
 
   async function submitOutcome({ outcome_label, notes, talk_seconds }) {
     if (callSid) {
-      try {
-        await api.logCallOutcome(callSid, { outcome_label, notes, talk_seconds });
-      } catch (e) {
-        console.warn('logCallOutcome failed', e.message);
-      }
+      try { await api.logCallOutcome(callSid, { outcome_label, notes, talk_seconds }); }
+      catch (e) { console.warn('logCallOutcome failed', e.message); }
     }
-    advance();
+    advance(callRef._remaining);
   }
 
-  function skipOutcome() { advance(); }
-  function skipCurrent() {
-    try { callRef.current?.disconnect(); } catch {}
-    advance();
+  function skipOutcome() { advance(callRef._remaining); }
+
+  function toggleMute() {
+    const next = !muted;
+    try { callRef.current?.mute(next); } catch {}
+    setMuted(next);
   }
+
+  function skipCurrent() {
+    stopAll();
+    // Lock advancingRef BEFORE disconnect so the call's disconnect handler
+    // sees it and bails out — prevents a double-advance race.
+    advancingRef.current = true;
+    try { callRef.current?.disconnect(); } catch {}
+    setCallPhaseSync('idle');
+    const rest = queue.slice(1);
+    setQueue(rest);
+    if (!pausedRef.current) setTimeout(() => dialNext(rest), 300);
+  }
+
   function togglePause() {
     setPaused((p) => {
       const next = !p;
-      if (!next && callPhase === 'idle') dialNext();
+      pausedRef.current = next;
+      if (!next && callPhaseRef.current === 'idle') dialNext(queue);
       return next;
     });
   }
+
   function endSession() {
     try { sseRef.current?.close(); } catch {}
-    stopAudio();
+    stopAll();
     try { callRef.current?.disconnect(); } catch {}
     nav(`/campaigns/${id}`);
   }
@@ -255,55 +368,74 @@ export default function DialSession() {
   if (err) return (
     <div className="error" style={{ padding: 20 }}>
       {err}
-      <div style={{ marginTop: 12 }}>
-        <Link to={`/campaigns/${id}`}>← Back to campaign</Link>
-      </div>
+      <div style={{ marginTop: 12 }}><Link to={`/campaigns/${id}`}>← Back to campaign</Link></div>
     </div>
   );
 
   if (phase === 'booting') return <div className="loading">Initializing Twilio Device…</div>;
 
-  if (phase === 'device_ready') {
-    return (
-      <div className="form-page">
-        <h1>Browser Dialer</h1>
-        <p className="muted">Twilio Device registered. Test your microphone, then start dialing.</p>
-        <div className="row">
-          <button onClick={testMic}>Test microphone</button>
-          {micOk === true && <span className="muted small">✓ mic OK</span>}
-          {micOk === false && <span className="error small">mic blocked</span>}
-        </div>
-        <div className="row" style={{ marginTop: 16 }}>
-          <button className="primary" onClick={startSession}>Start Dialing</button>
-          <Link to={`/campaigns/${id}`} className="ghost-link">Back to campaign</Link>
-        </div>
+  if (phase === 'device_ready') return (
+    <div className="form-page">
+      <h1>Browser Dialer</h1>
+      <p className="muted">Twilio Device registered. Test your microphone, then start dialing.</p>
+      <div className="row">
+        <button onClick={testMic}>Test microphone</button>
+        {micOk === true && <span className="muted small">✓ mic OK</span>}
+        {micOk === false && <span className="error small">mic blocked</span>}
       </div>
-    );
-  }
+      <div className="row" style={{ marginTop: 16 }}>
+        <button className="primary" onClick={startSession}>Start Dialing</button>
+        <Link to={`/campaigns/${id}`} className="ghost-link">Back to campaign</Link>
+      </div>
+    </div>
+  );
 
-  if (phase === 'ended') {
-    return (
-      <div className="empty">
-        <p>Session complete.</p>
-        <Link to={`/campaigns/${id}`}>← Back to campaign</Link>
-      </div>
-    );
-  }
+  if (phase === 'ended') return (
+    <div className="empty">
+      <p>Session complete.</p>
+      <Link to={`/campaigns/${id}`}>← Back to campaign</Link>
+    </div>
+  );
 
   if (!current) return <div className="loading">Loading next lead…</div>;
 
   const bio = current.bio_json || {};
   const fmt = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 
+  const phaseLabel = {
+    idle:       'IDLE',
+    announcing: 'ANNOUNCING',
+    dialing:    'DIALING',
+    ringing:    'RINGING',
+    live:       'LIVE',
+    vm:         'LEAVING VOICEMAIL',
+    noanswer:   'NO ANSWER',
+    outcome:    'LOG OUTCOME',
+  }[callPhase] ?? callPhase.toUpperCase();
+
   return (
     <div className="dial-session">
       <div className="dial-bar">
         <div className={`status ${callPhase}`}>
-          <span className="dot" /> {callPhase.toUpperCase()}
+          <span className="dot" /> {phaseLabel}
           {callPhase === 'live' && <span className="timer"> {fmt(talkSeconds)}</span>}
         </div>
         <div className="row">
-          <button onClick={skipCurrent}>Skip</button>
+          {callPhase === 'live' && (
+            <button onClick={sayMyName} disabled={sayingName}>
+              {sayingName ? 'Playing…' : 'Say my name'}
+            </button>
+          )}
+          {['ringing', 'live'].includes(callPhase) && (
+            <button onClick={leaveVoicemail} disabled={!callSid}>Drop Voicemail &amp; Next</button>
+          )}
+          {['dialing', 'ringing', 'live'].includes(callPhase) && (
+            <>
+              <button onClick={toggleMute}>{muted ? 'Unmute' : 'Mute'}</button>
+              <button className="danger" onClick={hangUp}>Hang Up</button>
+            </>
+          )}
+          <button onClick={skipCurrent} disabled={callPhase === 'idle'}>Skip</button>
           <button onClick={togglePause}>{paused ? 'Resume' : 'Pause'}</button>
           <button className="ghost" onClick={endSession}>End Session</button>
         </div>

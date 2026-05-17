@@ -6,6 +6,7 @@ import {
   audioPathForLead,
   announcePathForLead,
   announceFileExists,
+  MY_NAME_AUDIO_PATH,
 } from '../services/elevenlabs.js';
 import { client, publicBaseUrl, issueAccessToken } from '../services/twilio.js';
 import { logCallToApollo } from '../services/apollo.js';
@@ -223,7 +224,6 @@ twilioRouter.post('/status', async (req, res) => {
         status: newStatus,
         last_action: outcome,
         last_action_date: now,
-        last_called_at: now,
         sequence_step: nextStep,
       })
       .eq('id', leadId);
@@ -248,14 +248,42 @@ twilioRouter.post('/status', async (req, res) => {
   res.sendStatus(200);
 });
 
+// Trigger voicemail on demand — called by the browser dialer when the agent
+// manually wants to leave a voicemail. The browser SDK exposes the PARENT call
+// SID; we look up the active child leg (the dialed number) and redirect it to
+// the /voicemail TwiML, same as the AMD machine path. The browser leg
+// disconnects independently so the next call can start immediately.
+twilioRouter.post('/trigger-voicemail', async (req, res) => {
+  const { callSid, leadId } = req.body || {};
+  if (!callSid) return res.status(400).json({ error: 'callSid required' });
+  const base = publicBaseUrl();
+  try {
+    // callSid from the browser SDK is the parent leg — find the dialed child leg.
+    const children = await client().calls.list({ parentCallSid: callSid, limit: 5 });
+    const child = children.find(
+      (c) => c.status !== 'completed' && c.status !== 'canceled' && c.status !== 'failed',
+    );
+    if (!child) return res.status(404).json({ error: 'No active child call found' });
+    await client().calls(child.sid).update({
+      url: `${base}/api/twilio/voicemail?leadId=${encodeURIComponent(leadId || '')}`,
+      method: 'POST',
+    });
+    res.json({ ok: true, childSid: child.sid });
+  } catch (e) {
+    console.warn('[twilio/trigger-voicemail] failed', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Audio file serving for voicemail mp3s and pre-roll announcement clips.
-// Accepts both `{uuid}.mp3` (lead VM) and `announce_{uuid}.mp3` (announce clip).
+// Accepts `{uuid}.mp3`, `announce_{uuid}.mp3`, and the special `my_name.mp3`.
 export function audioStaticHandler(req, res) {
   const file = req.params.file;
   const announceMatch = file.match(/^announce_([a-f0-9-]+)\.mp3$/i);
   const leadMatch = file.match(/^([a-f0-9-]+)\.mp3$/i);
   let p;
-  if (announceMatch) p = announcePathForLead(announceMatch[1]);
+  if (file === 'my_name.mp3') p = MY_NAME_AUDIO_PATH;
+  else if (announceMatch) p = announcePathForLead(announceMatch[1]);
   else if (leadMatch) p = audioPathForLead(leadMatch[1]);
   else return res.sendStatus(404);
   if (!fs.existsSync(p)) return res.sendStatus(404);

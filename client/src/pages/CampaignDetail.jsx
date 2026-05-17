@@ -56,7 +56,8 @@ export default function CampaignDetail() {
 
   async function toggleStatus() {
     const next = campaign.status === 'running' ? 'paused' : 'running';
-    setCampaign(await api.updateCampaign(id, { status: next }));
+    await api.updateCampaign(id, { status: next });
+    reload();
   }
 
   async function deleteCampaign() {
@@ -607,14 +608,21 @@ function Bio({ bio }) {
 function OwnersTab({ campaignId, sequenceConfig }) {
   const [owners, setOwners] = useState(null);
   const [err, setErr] = useState(null);
+  const [loading, setLoading] = useState(true);
   const [sortBy, setSortBy] = useState('priority_score');
   const [sortDir, setSortDir] = useState('desc');
 
   async function load() {
+    setLoading(true);
+    setErr(null);
     try {
       const r = await api.listLeadOwners(campaignId);
       setOwners(r.owners || []);
-    } catch (e) { setErr(e.message); }
+    } catch (e) {
+      setErr(e.message || 'Failed to load owners — try reloading.');
+    } finally {
+      setLoading(false);
+    }
   }
   useEffect(() => { load(); /* eslint-disable-next-line */ }, [campaignId]);
 
@@ -643,13 +651,19 @@ function OwnersTab({ campaignId, sequenceConfig }) {
     } catch (e) { alert(`Delete failed: ${e.message}`); }
   }
 
-  if (err) return <div className="error">{err}</div>;
-  if (!owners) return <div className="loading">Loading owners…</div>;
-  if (!owners.length) {
+  if (loading) return <div className="loading">Loading owners…</div>;
+  if (err) return (
+    <div className="empty">
+      <p className="error">{err}</p>
+      <button onClick={load} style={{ marginTop: 8 }}>Retry</button>
+    </div>
+  );
+  if (!owners || !owners.length) {
     return (
       <div className="empty">
         <p>No owners discovered yet.</p>
         <p className="muted small">Owner discovery runs during launch for leads scoring above 50. If the pipeline finished without discovering owners, try the rediscover-owners script.</p>
+        <button onClick={load} style={{ marginTop: 8 }}>Reload</button>
       </div>
     );
   }
@@ -669,6 +683,9 @@ function OwnersTab({ campaignId, sequenceConfig }) {
 
   return (
     <div className="leads-wrap">
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 8 }}>
+        <button className="ghost" onClick={load}>Reload</button>
+      </div>
       <table className="leads">
         <thead>
           <tr>

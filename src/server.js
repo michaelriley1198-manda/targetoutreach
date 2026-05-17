@@ -3,11 +3,13 @@ import express from 'express';
 import cors from 'cors';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { synthesizeMyName } from './services/elevenlabs.js';
 import { campaignsRouter } from './routes/campaigns.js';
 import { leadsRouter, leadOwnersRouter } from './routes/leads.js';
 import { twilioRouter, audioStaticHandler } from './routes/twilio.js';
 import { apolloRouter } from './routes/apollo.js';
 import { sourcesRouter } from './routes/sources.js';
+import { signalhireRouter } from './routes/signalhire.js';
 import { startSequenceCron } from './cron/sequence.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -57,6 +59,7 @@ app.use('/api/lead-owners', leadOwnersRouter);
 app.use('/api/twilio', twilioRouter);
 app.use('/api/apollo', apolloRouter);
 app.use('/api/sources', sourcesRouter);
+app.use('/api/signalhire', signalhireRouter);
 
 app.get('/audio/:file', audioStaticHandler);
 
@@ -79,4 +82,7 @@ app.listen(PORT, () => {
   console.log(`[server] listening on :${PORT}`);
   checkEnv();
   startSequenceCron();
+  synthesizeMyName('Michael Riley').catch((e) =>
+    console.warn('[server] my_name.mp3 synthesis failed:', e.message)
+  );
 });

@@ -1,12 +1,13 @@
 import express from 'express';
 import { supabase } from '../db.js';
 import { generatePromptsForCampaign, launchCampaign } from '../pipeline/run.js';
+import { deduplicateCampaign } from '../pipeline/dedup.js';
 import { getProgress } from '../pipeline/progress.js';
 import { synthesizeVoicemail, renderScript, audioFileExists, synthesizeAnnouncement, announceFileExists } from '../services/elevenlabs.js';
 import crypto from 'node:crypto';
 import { setSequenceActive, archiveSequence, getContactById } from '../services/apollo.js';
 import { fallbackContact as leadMagicFallback } from '../services/leadmagic.js';
-import axios from 'axios';
+import { requestContacts as shRequestContacts } from '../services/signalhire.js';
 
 export const campaignsRouter = express.Router();
 
@@ -150,24 +151,31 @@ campaignsRouter.patch('/:id', wrap(async (req, res) => {
 // edits or the rediscover-owners script. Results land at
 // /api/apollo/enrichment-webhook over the next several minutes.
 campaignsRouter.post('/:id/reveal-contacts', wrap(async (req, res) => {
-  const base = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
-  const webhookUrl = base ? `${base}/api/apollo/enrichment-webhook` : null;
-
-  // Join owners with their lead's company_url + existing contact fields.
   const { data: leads } = await supabase
     .from('leads')
     .select('id, company_url, phone, email')
-    .eq('campaign_id', req.params.id);
+    .eq('campaign_id', req.params.id)
+    .neq('pass_fail', 'FAIL');
   if (!leads?.length) return res.json({ ok: true, queued: 0, total: 0, message: 'No leads in this campaign yet' });
 
   const leadById = new Map(leads.map((l) => [l.id, l]));
-  const { data: owners, error } = await supabase
-    .from('lead_owners')
-    .select('id, lead_id, first_name, last_name, apollo_contact_id, linkedin_url, email, phone, phone_status, email_status')
-    .in('lead_id', leads.map((l) => l.id))
-    .or('email.is.null,phone.is.null');
-  if (error) return res.status(500).json({ error: `Owners lookup failed: ${error.message}` });
-  if (!owners?.length) return res.json({ ok: true, queued: 0, total: 0, message: 'All owners already have email and phone' });
+
+  // Batch .in() to avoid URL-length limits on large campaigns (PostgREST GET limit).
+  const BATCH = 100;
+  const leadIds = leads.map((l) => l.id);
+  const ownerBatches = await Promise.all(
+    Array.from({ length: Math.ceil(leadIds.length / BATCH) }, (_, i) =>
+      supabase
+        .from('lead_owners')
+        .select('id, lead_id, first_name, last_name, apollo_contact_id, linkedin_url, email, phone, phone_status, email_status')
+        .in('lead_id', leadIds.slice(i * BATCH, (i + 1) * BATCH))
+        .or('email.is.null,phone.is.null')
+    )
+  );
+  const batchError = ownerBatches.find((b) => b.error)?.error;
+  if (batchError) return res.status(500).json({ error: `Owners lookup failed: ${batchError.message}` });
+  const owners = ownerBatches.flatMap((b) => b.data || []);
+  if (!owners.length) return res.json({ ok: true, queued: 0, total: 0, message: 'All owners already have email and phone' });
 
   function domainFromUrl(url) {
     if (!url) return null;
@@ -175,7 +183,6 @@ campaignsRouter.post('/:id/reveal-contacts', wrap(async (req, res) => {
     try { return new URL(withProto).hostname.replace(/^www\./, ''); } catch { return null; }
   }
 
-  // Mirror a phone/email update back to the lead row so the dialer picks it up.
   async function mirrorToLead(leadId, { phone, email, phone_status, email_status } = {}) {
     const lead = leadById.get(leadId);
     if (!lead) return;
@@ -188,81 +195,33 @@ campaignsRouter.post('/:id/reveal-contacts', wrap(async (req, res) => {
   }
 
   const CONCURRENCY = 8;
-  let queued = 0, skipped = 0, failed = 0;
+  let queued = 0, skipped = 0;
 
   async function fireOne(owner) {
     const lead = leadById.get(owner.lead_id);
     const domain = domainFromUrl(lead?.company_url);
-    if (!owner.apollo_contact_id && (!owner.first_name || !domain)) { skipped++; return; }
+    if (!owner.first_name || !owner.last_name || !domain) { skipped++; return; }
 
-    // Pass 1: Apollo direct GET — reads already-stored data, zero credits
-    if (owner.apollo_contact_id) {
+    // Apollo cached email (free) — try before spending LeadMagic credits.
+    let prefilledEmail = null;
+    if (!owner.email && owner.apollo_contact_id) {
       const r = await getContactById(owner.apollo_contact_id).catch(() => null);
-      if (r) {
-        const ownerPatch = {};
-        if (r.phone && !owner.phone) { ownerPatch.phone = r.phone; if (r.phone_status) ownerPatch.phone_status = r.phone_status; }
-        if (r.email && !owner.email) { ownerPatch.email = r.email; if (r.email_status) ownerPatch.email_status = r.email_status; }
-        if (Object.keys(ownerPatch).length) {
-          ownerPatch.enrichment_source = 'apollo';
-          await supabase.from('lead_owners').update(ownerPatch).eq('id', owner.id);
-          Object.assign(owner, ownerPatch);
-          await mirrorToLead(owner.lead_id, ownerPatch);
-        }
+      if (r?.email) {
+        prefilledEmail = r.email;
+        const patch = { email: r.email, email_status: 'apollo_cached' };
+        await supabase.from('lead_owners').update(patch).eq('id', owner.id);
+        Object.assign(owner, patch);
+        await mirrorToLead(owner.lead_id, patch);
       }
     }
 
-    // Pass 2: Apollo waterfall — async backstop, only if still missing and webhook is available
-    if ((!owner.phone || !owner.email) && webhookUrl) {
-      const body = {
-        webhook_url: webhookUrl,
-        reveal_personal_emails: true,
-        reveal_phone_number: true,
-        run_waterfall_email: true,
-        run_waterfall_phone: true,
-      };
-      if (owner.apollo_contact_id) body.id = owner.apollo_contact_id;
-      if (owner.first_name) body.first_name = owner.first_name;
-      if (owner.last_name) body.last_name = owner.last_name;
-      if (domain) body.domain = domain;
-      if (owner.linkedin_url) body.linkedin_url = owner.linkedin_url;
-
-      try {
-        const { data } = await axios.post('https://api.apollo.io/api/v1/people/match', body, {
-          headers: { 'X-Api-Key': process.env.APOLLO_API_KEY, 'Content-Type': 'application/json' },
-          timeout: 30_000,
-        });
-        const p = data?.person || {};
-        const syncPatch = {};
-        const newId = p.id;
-        if (newId && newId !== owner.apollo_contact_id) syncPatch.apollo_contact_id = newId;
-        const syncPhone = p.sanitized_phone || p.phone_numbers?.[0]?.sanitized_number || p.phone_numbers?.[0]?.raw_number || null;
-        const syncEmail = p.email || p.personal_emails?.[0] || null;
-        if (syncPhone && !owner.phone) { syncPatch.phone = syncPhone; syncPatch.phone_status = 'verified'; }
-        if (syncEmail && !owner.email) syncPatch.email = syncEmail;
-        if (Object.keys(syncPatch).length) {
-          if (syncPatch.phone || syncPatch.email) syncPatch.enrichment_source = 'apollo';
-          await supabase.from('lead_owners').update(syncPatch).eq('id', owner.id);
-          Object.assign(owner, syncPatch);
-          await mirrorToLead(owner.lead_id, syncPatch);
-        }
-        queued++;
-      } catch (e) {
-        failed++;
-        console.warn('[reveal-contacts] apollo waterfall failed', owner.first_name, e.response?.data?.error || e.message);
-      }
-    } else {
-      queued++;
+    const lm = await leadMagicFallback(owner, { companyDomain: domain, prefilledEmail }).catch(() => null);
+    if (lm) {
+      await supabase.from('lead_owners').update(lm).eq('id', owner.id);
+      Object.assign(owner, lm);
+      await mirrorToLead(owner.lead_id, lm);
     }
-
-    // Pass 3: LeadMagic direct — synchronous, no credits, only if still missing
-    if ((!owner.phone || !owner.email) && owner.first_name && owner.last_name && domain) {
-      const lm = await leadMagicFallback(owner, { companyDomain: domain }).catch(() => null);
-      if (lm) {
-        await supabase.from('lead_owners').update(lm).eq('id', owner.id);
-        Object.assign(owner, lm);
-        await mirrorToLead(owner.lead_id, lm);
-      }
-    }
+    queued++;
   }
 
   let i = 0;
@@ -275,14 +234,40 @@ campaignsRouter.post('/:id/reveal-contacts', wrap(async (req, res) => {
     })
   );
 
+  // Signal Hire pass — async webhook, for owners still missing phone after LeadMagic.
+  // Uses linkedin_url or email as the lookup identifier; results arrive via webhook.
+  let shQueued = 0;
+  const base = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
+  if (process.env.SIGNALHIRE_API_KEY && base) {
+    const shTargets = owners
+      .filter((o) => !o.phone && (o.linkedin_url || o.email));
+    if (shTargets.length) {
+      const callbackUrl = `${base}/api/signalhire/webhook`;
+      // Batch into groups of 100 (Signal Hire limit per request)
+      for (let j = 0; j < shTargets.length; j += 100) {
+        const batch = shTargets.slice(j, j + 100);
+        const items = batch.map((o) => o.linkedin_url || o.email);
+        await shRequestContacts(items, callbackUrl).catch(() => null);
+        shQueued += batch.length;
+      }
+    }
+  }
+
   res.json({
     ok: true,
     total: owners.length,
     queued,
     skipped,
-    failed,
-    message: `Processed ${queued}/${owners.length} owners — direct Apollo fetch + LeadMagic ran synchronously; waterfall results (if any) arrive via webhook. Refresh to see updated phones.`,
+    shQueued,
+    message: `LeadMagic: processed ${queued}/${owners.length} owners.${shQueued ? ` Signal Hire queued ${shQueued} for phone — results arrive via webhook.` : ''} Refresh to see updated contacts.`,
   });
+}));
+
+// On-demand dedup: remove duplicate leads (same domain) and duplicate owners
+// (same email) within a campaign.
+campaignsRouter.post('/:id/deduplicate', wrap(async (req, res) => {
+  const result = await deduplicateCampaign(req.params.id);
+  res.json({ ok: true, ...result });
 }));
 
 // Delete a campaign: deactivate + archive in Apollo, then remove our row (cascade
@@ -364,8 +349,8 @@ campaignsRouter.get('/:id/call-queue', wrap(async (req, res) => {
     const step = seq[l.sequence_step];
     if (!step || !step.active || step.type !== 'call') return false;
     if (l.status === 'connected' || l.status === 'meeting' || l.status === 'passed') return false;
-    if (step.wait_days > 0 && l.last_called_at) {
-      const daysSince = (now - new Date(l.last_called_at)) / 86_400_000;
+    if (step.wait_days > 0 && l.last_action_date) {
+      const daysSince = (now - new Date(l.last_action_date)) / 86_400_000;
       if (daysSince < step.wait_days) return false;
     }
     return true;
@@ -404,8 +389,8 @@ campaignsRouter.post('/:id/dial', wrap(async (req, res) => {
     const step = seq[l.sequence_step];
     if (!step?.active || step.type !== 'call') return false;
     if (['connected', 'meeting', 'passed'].includes(l.status)) return false;
-    if (step.wait_days > 0 && l.last_called_at) {
-      const daysSince = (nowMs - new Date(l.last_called_at)) / 86_400_000;
+    if (step.wait_days > 0 && l.last_action_date) {
+      const daysSince = (nowMs - new Date(l.last_action_date)) / 86_400_000;
       if (daysSince < step.wait_days) return false;
     }
     return true;

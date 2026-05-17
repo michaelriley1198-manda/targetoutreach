@@ -59,6 +59,12 @@ async function synthesizeMp3(targetPath, text) {
   return targetPath;
 }
 
+export const MY_NAME_AUDIO_PATH = path.join(path.resolve('audio_cache'), 'my_name.mp3');
+
+export async function synthesizeMyName(text) {
+  return synthesizeMp3(MY_NAME_AUDIO_PATH, text);
+}
+
 export async function synthesizeVoicemail(leadId, text) {
   return synthesizeMp3(audioPathForLead(leadId), text);
 }

@@ -16,10 +16,9 @@ import {
 import { mapRowsToLeads } from '../services/csv.js';
 import { discoverOwners } from '../services/owners.js';
 import { findCompany as leadMagicFindCompany, fallbackContact as leadMagicFallback } from '../services/leadmagic.js';
+import { requestContacts as shRequestContacts } from '../services/signalhire.js';
+import { deduplicateCampaign } from './dedup.js';
 import { setProgress, clearProgress } from './progress.js';
-import axios from 'axios';
-
-const APOLLO_BASE = 'https://api.apollo.io/api/v1';
 
 const ENRICH_CONCURRENCY = 4;
 const SCORE_CONCURRENCY = 6;
@@ -27,9 +26,10 @@ const OWNER_CONCURRENCY = 4;
 const REVEAL_CONCURRENCY = 6;
 
 const QUERIES_PER_BATCH = 25;
-const RESULTS_PER_QUERY = 15;
+const RESULTS_PER_QUERY = 25;
 
 // Score above which we pay for the holistic Claude profile + owner discovery.
+// Overridden per-campaign by min_priority_score if that is lower.
 const HOLISTIC_SCORE_THRESHOLD = 50;
 
 async function runPool(items, concurrency, worker, onItemDone) {
@@ -282,53 +282,6 @@ async function enrichFirmographicsOne(row) {
   }
 }
 
-// ----------------------------------------------------------------------------
-// Stage 8 — Apollo people/match per owner with waterfall enabled, so any
-// missing email/phone arrives later at /api/apollo/enrichment-webhook.
-// Returns a partial { apollo_contact_id, email, phone, email_status,
-// phone_status, linkedin_url } update for the lead_owners row.
-// ----------------------------------------------------------------------------
-async function apolloRevealOwner({ firstName, lastName, linkedinUrl, domain, existingApolloId }) {
-  if (!firstName || !domain) return null;
-  const base = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
-  const webhookUrl = base ? `${base}/api/apollo/enrichment-webhook` : null;
-
-  const body = {
-    first_name: firstName,
-    domain,
-    reveal_personal_emails: true,
-  };
-  if (lastName) body.last_name = lastName;
-  if (linkedinUrl) body.linkedin_url = linkedinUrl;
-  if (existingApolloId) body.id = existingApolloId;
-  if (webhookUrl) {
-    body.webhook_url = webhookUrl;
-    body.reveal_phone_number = true;
-    body.run_waterfall_email = true;
-    body.run_waterfall_phone = true;
-  }
-
-  try {
-    const { data } = await axios.post(`${APOLLO_BASE}/people/match`, body, {
-      headers: { 'X-Api-Key': process.env.APOLLO_API_KEY, 'Content-Type': 'application/json' },
-      timeout: 30_000,
-    });
-    const p = data?.person || {};
-    return {
-      apollo_contact_id: p.id || existingApolloId || null,
-      email: p.email || p.personal_emails?.[0] || null,
-      phone:
-        p.sanitized_phone ||
-        p.phone_numbers?.[0]?.sanitized_number ||
-        p.phone_numbers?.[0]?.raw_number ||
-        null,
-      linkedin_url: p.linkedin_url || linkedinUrl || null,
-    };
-  } catch (e) {
-    console.warn('[pipeline] apolloRevealOwner failed', firstName, domain, e.response?.data?.error || e.message);
-    return null;
-  }
-}
 
 // ----------------------------------------------------------------------------
 // Main pipeline
@@ -526,8 +479,9 @@ export async function launchCampaign(campaignId, providedQueries = null, opts = 
       return { inserted: pass.length };
     }
 
-    // ----- Stage 5: holistic Claude profile (score > 50 only) -----------------
-    const highPri = pass.filter((r) => (r.priority_score ?? 0) > HOLISTIC_SCORE_THRESHOLD);
+    // ----- Stage 5: holistic Claude profile (score ≥ campaign threshold) ------
+    const holisticThreshold = Math.min(minScore, HOLISTIC_SCORE_THRESHOLD);
+    const highPri = pass.filter((r) => (r.priority_score ?? 0) >= holisticThreshold);
     onProgress({
       stage: 'holistic',
       message: `Holistic profile for ${highPri.length} high-priority leads`,
@@ -567,6 +521,9 @@ export async function launchCampaign(campaignId, providedQueries = null, opts = 
         onProgress({ current: holOk + holFail });
       }
     );
+
+    // ----- Stage 5b: dedup leads by domain, owners by email -------------------
+    await deduplicateCampaign(campaignId);
 
     // ----- Stage 6: owner discovery (PASS + score > 50) ----------------------
     onProgress({
@@ -644,86 +601,26 @@ export async function launchCampaign(campaignId, providedQueries = null, opts = 
       }
     );
 
-    // ----- Stage 7a: Apollo direct contact fetch for known IDs (zero credits) --
-    // Reads whatever Apollo already has stored, including manually-unlocked phones.
-    // Runs before the waterfall so we only charge credits for contacts truly missing data.
-    const directFetchTargets = allOwnerRows.filter((o) => o.apollo_contact_id && (!o.email || !o.phone));
-    if (directFetchTargets.length) {
-      onProgress({
-        stage: 'reveal',
-        message: `Apollo direct fetch for ${directFetchTargets.length} known contacts`,
-        current: 0, total: directFetchTargets.length,
-      });
-      let dfOk = 0, dfFail = 0;
-      await runPool(
-        directFetchTargets,
-        REVEAL_CONCURRENCY,
-        async (owner) => {
-          const r = await getContactById(owner.apollo_contact_id);
-          if (!r) return null;
-          const update = {};
-          if (r.email && !owner.email) update.email = r.email;
-          if (r.phone && !owner.phone) update.phone = r.phone;
-          if (r.phone_status && !owner.phone_status) update.phone_status = r.phone_status;
-          if (r.email_status && !owner.email_status) update.email_status = r.email_status;
-          if (Object.keys(update).length) {
-            if (update.email || update.phone) update.enrichment_source = 'apollo';
-            await supabase.from('lead_owners').update(update).eq('id', owner.id);
-            Object.assign(owner, update);
-          }
-          return r;
-        },
-        ({ ok }) => {
-          if (ok) dfOk++; else dfFail++;
-          onProgress({ current: dfOk + dfFail });
-        }
-      );
-    }
-
-    // ----- Stage 7: Apollo people-match reveal per owner (waterfall queued) ---
-    const ownersToReveal = allOwnerRows.filter((o) => o.first_name && o._domain && (!o.email || !o.phone));
-    onProgress({
-      stage: 'reveal',
-      message: `Apollo waterfall reveal for ${ownersToReveal.length} owners`,
-      current: 0, total: ownersToReveal.length,
-    });
-    let revealOk = 0, revealFail = 0;
-    await runPool(
-      ownersToReveal,
-      REVEAL_CONCURRENCY,
-      async (owner) => {
-        const r = await apolloRevealOwner({
-          firstName: owner.first_name,
-          lastName: owner.last_name,
-          linkedinUrl: owner.linkedin_url,
-          domain: owner._domain,
-          existingApolloId: owner.apollo_contact_id,
-        });
-        if (!r) return null;
-        const update = {};
-        if (r.apollo_contact_id && r.apollo_contact_id !== owner.apollo_contact_id) update.apollo_contact_id = r.apollo_contact_id;
-        if (r.email && !owner.email) update.email = r.email;
-        if (r.phone && !owner.phone) update.phone = r.phone;
-        if (r.linkedin_url && !owner.linkedin_url) update.linkedin_url = r.linkedin_url;
-        if (Object.keys(update).length) {
-          if (update.email || update.phone) update.enrichment_source = 'apollo';
-          await supabase.from('lead_owners').update(update).eq('id', owner.id);
-          Object.assign(owner, update);
+    // ----- Stage 7a: Apollo cached email for known contact IDs (free) ---------
+    const apolloCacheTargets = allOwnerRows.filter((o) => o.apollo_contact_id && !o.email);
+    if (apolloCacheTargets.length) {
+      await runPool(apolloCacheTargets, REVEAL_CONCURRENCY, async (owner) => {
+        const r = await getContactById(owner.apollo_contact_id).catch(() => null);
+        const email = r?.email || null;
+        if (email) {
+          await supabase.from('lead_owners').update({ email, email_status: 'apollo_cached' }).eq('id', owner.id);
+          owner.email = email;
         }
         return r;
-      },
-      ({ ok }) => {
-        if (ok) revealOk++; else revealFail++;
-        onProgress({ current: revealOk + revealFail });
-      }
-    );
+      }, () => {});
+    }
 
-    // ----- Stage 8: LeadMagic auto-fallback for owners still missing contact -
+    // ----- Stage 7: LeadMagic contact enrichment (phone + email fallback) ----
     const lmTargets = allOwnerRows.filter((o) => o.first_name && o.last_name && o._domain && (!o.email || !o.phone));
     if (process.env.LEADMAGIC_API_KEY && lmTargets.length) {
       onProgress({
         stage: 'leadmagic',
-        message: `LeadMagic fallback for ${lmTargets.length} owners`,
+        message: `LeadMagic enrichment for ${lmTargets.length} owners`,
         current: 0, total: lmTargets.length,
       });
       let lmOk = 0, lmFail = 0;
@@ -743,6 +640,23 @@ export async function launchCampaign(campaignId, providedQueries = null, opts = 
           onProgress({ current: lmOk + lmFail });
         }
       );
+    }
+
+    // ----- Stage 8: Signal Hire async phone enrichment -------------------------
+    // Queues owners still missing phone via Signal Hire webhook; results land
+    // at /api/signalhire/webhook after processing (seconds to minutes).
+    const shBase = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
+    if (process.env.SIGNALHIRE_API_KEY && shBase) {
+      const shTargets = allOwnerRows.filter((o) => !o.phone && (o.linkedin_url || o.email));
+      if (shTargets.length) {
+        onProgress({ stage: 'signalhire', message: `Signal Hire queued for ${shTargets.length} owners`, current: 0, total: shTargets.length });
+        const callbackUrl = `${shBase}/api/signalhire/webhook`;
+        for (let j = 0; j < shTargets.length; j += 100) {
+          const batch = shTargets.slice(j, j + 100);
+          const items = batch.map((o) => o.linkedin_url || o.email);
+          await shRequestContacts(items, callbackUrl).catch(() => null);
+        }
+      }
     }
 
     // ----- Stage 9: mirror primary owner → leads (legacy compat for dialer) --
@@ -772,7 +686,7 @@ export async function launchCampaign(campaignId, providedQueries = null, opts = 
       }).eq('id', leadId);
     }
 
-    // Stage 10 (Apollo sequence creation) removed — outreach is managed in-tool.
+    // Stage 10 removed — outreach is managed in-tool.
 
     await supabase.from('campaigns').update({ status: 'running' }).eq('id', campaignId);
     onProgress({

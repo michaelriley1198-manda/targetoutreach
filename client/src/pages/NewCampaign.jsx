@@ -17,7 +17,7 @@ export default function NewCampaign() {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [targetLeads, setTargetLeads] = useState(150);
   const [minScore, setMinScore] = useState(50);
-  const [maxBatches, setMaxBatches] = useState(4);
+  const [maxBatches, setMaxBatches] = useState(6);
   const [excludedAcquirers, setExcludedAcquirers] = useState('');
   const [requireIndependent, setRequireIndependent] = useState(true);
 
@@ -177,8 +177,8 @@ export default function NewCampaign() {
               </label>
               <label>
                 <span>Max Exa search batches</span>
-                <input type="number" min={1} max={10} value={maxBatches}
-                  onChange={(e) => setMaxBatches(parseInt(e.target.value, 10) || 4)} />
+                <input type="number" min={1} max={15} value={maxBatches}
+                  onChange={(e) => setMaxBatches(parseInt(e.target.value, 10) || 6)} />
               </label>
             </div>
           )}
