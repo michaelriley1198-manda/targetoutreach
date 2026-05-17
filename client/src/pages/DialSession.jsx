@@ -38,6 +38,7 @@ export default function DialSession() {
   const vmTimeoutRef     = useRef(null);
   const callSidRef       = useRef(null);
   const childCallSidRef  = useRef(null);
+  const callGenRef       = useRef(0);
 
   // Refs that async callbacks read — avoids stale closure bugs
   const callPhaseRef = useRef('idle');
@@ -127,6 +128,7 @@ export default function DialSession() {
   }
 
   async function dialNext(remaining) {
+    const myGen = ++callGenRef.current;
     advancingRef.current = false;
     stopAll();
     setSayingName(false);
@@ -173,6 +175,10 @@ export default function DialSession() {
       if (sid) { setCallSid(sid); callSidRef.current = sid; }
 
       call.on('disconnect', () => {
+        // Ignore stale disconnects from a previous call (e.g. server-side hangup
+        // arriving after we've already moved to the next lead via voicemail drop).
+        if (callGenRef.current !== myGen) return;
+
         clearInterval(liveTimerRef.current);
         clearTimeout(noAnswerTimerRef.current);
 
@@ -289,35 +295,28 @@ export default function DialSession() {
     }
   }
 
-  // Drop voicemail and immediately advance to the next lead.
-  // Must AWAIT the server redirect before disconnecting — otherwise Twilio
-  // hangs up the child call when the parent disconnects and no VM plays.
-  async function leaveVoicemail() {
-    if (droppingVm) return;
+  // Drop voicemail in the background and immediately advance to the next lead.
+  // The server redirects the child leg to /voicemail TwiML then hangs up the
+  // parent call — the browser SDK gets a clean disconnect that the generation
+  // guard ignores since we've already moved on.
+  function leaveVoicemail() {
     const sid = callSidRef.current;
     const childSid = childCallSidRef.current;
     const rem = callRef._remaining;
     const leadId = rem?.[0]?.id;
 
-    setDroppingVm(true);
     clearTimeout(noAnswerTimerRef.current);
     clearInterval(liveTimerRef.current);
-    // Lock advancing before the await so any stray disconnect event during the
-    // network call doesn't double-advance.
-    advancingRef.current = true;
 
-    try {
-      await fetch('/api/twilio/trigger-voicemail', {
+    // Fire and forget — server handles both the child redirect and parent hangup.
+    if (sid || childSid) {
+      fetch('/api/twilio/trigger-voicemail', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ callSid: sid, childCallSid: childSid, leadId }),
-      });
-    } catch (e) {
-      console.warn('[leaveVoicemail] trigger failed', e.message);
+      }).catch((e) => console.warn('[leaveVoicemail] trigger failed', e.message));
     }
 
-    // Redirect is confirmed — now safe to drop the browser leg.
-    try { callRef.current?.disconnect(); } catch {}
     advance(rem);
   }
 
@@ -445,9 +444,7 @@ export default function DialSession() {
             </button>
           )}
           {['ringing', 'live'].includes(callPhase) && (
-            <button onClick={leaveVoicemail} disabled={droppingVm}>
-              {droppingVm ? 'Dropping…' : 'Drop Voicemail & Next'}
-            </button>
+            <button onClick={leaveVoicemail}>Drop Voicemail &amp; Next</button>
           )}
           {['dialing', 'ringing', 'live'].includes(callPhase) && (
             <>

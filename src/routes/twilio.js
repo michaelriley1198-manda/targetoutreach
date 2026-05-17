@@ -134,19 +134,16 @@ twilioRouter.get('/dial-session/:sessionId/events', (req, res) => {
   req.on('close', unsubscribe);
 });
 
-// ----------------------------------------------------------------------------
-// Legacy voicemail TwiML — UNCHANGED. Reused when AMD=machine redirects the
-// dialed leg here. Plays identify clip + per-lead VM, then hangs up.
-// ----------------------------------------------------------------------------
+// Voicemail TwiML — plays the ElevenLabs per-lead recording then hangs up.
+// The identify clip ("Michael Riley from Boyne Capital") has been removed;
+// the ElevenLabs script already introduces the caller naturally.
 twilioRouter.all('/voicemail', (req, res) => {
-  const { leadId, human } = req.query;
+  const { leadId } = req.query;
   const base = publicBaseUrl();
   const VR = twilio.twiml.VoiceResponse;
   const r = new VR();
 
   r.pause({ length: 1 });
-  r.play(`${base}/audio/${IDENTIFY_AUDIO_ID}.mp3`);
-  r.pause({ length: human ? 5 : 1 });
 
   if (leadId && audioFileExists(leadId)) {
     r.play(`${base}/audio/${leadId}.mp3`);
@@ -279,6 +276,11 @@ twilioRouter.post('/trigger-voicemail', async (req, res) => {
       url: `${base}/api/twilio/voicemail?leadId=${encodeURIComponent(leadId || '')}`,
       method: 'POST',
     });
+    // Hang up the parent (browser) leg so the SDK fires a clean disconnect
+    // while the child leg plays the voicemail independently.
+    if (callSid) {
+      try { await client().calls(callSid).update({ status: 'completed' }); } catch {}
+    }
     res.json({ ok: true, childSid: targetSid });
   } catch (e) {
     console.warn('[twilio/trigger-voicemail] failed', e.message);
