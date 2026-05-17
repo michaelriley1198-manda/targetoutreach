@@ -3,7 +3,8 @@ import { supabase } from '../db.js';
 import { generatePromptsForCampaign, launchCampaign } from '../pipeline/run.js';
 import { deduplicateCampaign } from '../pipeline/dedup.js';
 import { getProgress } from '../pipeline/progress.js';
-import { synthesizeVoicemail, renderScript, audioFileExists, synthesizeAnnouncement, announceFileExists } from '../services/elevenlabs.js';
+import { synthesizeVoicemail, renderScript, audioFileExists, synthesizeAnnouncement, announceFileExists, audioPathForLead } from '../services/elevenlabs.js';
+import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { setSequenceActive, archiveSequence, getContactById } from '../services/apollo.js';
 import { fallbackContact as leadMagicFallback } from '../services/leadmagic.js';
@@ -141,6 +142,15 @@ campaignsRouter.patch('/:id', wrap(async (req, res) => {
     .select()
     .single();
   if (error) return res.status(500).json({ error: `Update failed: ${error.message}` });
+
+  // If the voicemail script changed, purge cached audio so leads re-synthesize on next dial.
+  if ('vm_script' in update || 'vm_scripts' in update) {
+    const { data: leads } = await supabase.from('leads').select('id').eq('campaign_id', req.params.id);
+    for (const lead of leads || []) {
+      const p = audioPathForLead(lead.id);
+      if (fs.existsSync(p)) fs.unlinkSync(p);
+    }
+  }
 
   res.json(data);
 }));
