@@ -32,6 +32,18 @@ twilioRouter.get('/token', (req, res) => {
 });
 
 // ----------------------------------------------------------------------------
+// Incoming call forwarding — any inbound call to the Twilio number is forwarded
+// to Michael's cell. Set this URL as the "A call comes in" webhook on the
+// Twilio phone number (Voice → Webhook → /api/twilio/incoming, HTTP POST).
+// ----------------------------------------------------------------------------
+twilioRouter.post('/incoming', (req, res) => {
+  const VR = twilio.twiml.VoiceResponse;
+  const r = new VR();
+  r.dial({ callerId: req.body?.To || process.env.TWILIO_PHONE_NUMBER }, '7865392268');
+  res.type('text/xml').send(r.toString());
+});
+
+// ----------------------------------------------------------------------------
 // /connect — invoked by the TwiML App when the browser Device calls
 // device.connect({ params: { leadId, toNumber, sessionId } }). Dials the lead
 // from the server with answerOnBridge so the browser only hears ringback until
